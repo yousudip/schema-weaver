@@ -76,6 +76,45 @@ body {
   gap: 0.5rem;
 }
 
+/* When the title row also holds the view-toggle */
+.panel-title-row {
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+/* ── View toggle ── */
+.view-toggle {
+  display: flex;
+  background: var(--gray-100);
+  border: 1px solid var(--gray-200);
+  border-radius: 8px;
+  padding: 3px;
+  gap: 3px;
+}
+
+.view-toggle-btn {
+  padding: 5px 14px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--gray-600);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  white-space: nowrap;
+}
+.view-toggle-btn:hover {
+  background: white;
+  color: var(--brand);
+}
+.view-toggle-active {
+  background: var(--brand) !important;
+  color: white !important;
+  box-shadow: 0 1px 4px rgba(109,40,217,0.3);
+}
+
 .panel-header {
   display: flex;
   justify-content: space-between;

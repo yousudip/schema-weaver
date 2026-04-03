@@ -30,6 +30,9 @@ interface Job {
 }
 
 
+type ColumnState = 'pending' | 'accepted' | 'rejected'
+type ReviewMode = 'cards' | 'map'
+
 type ToastType = 'success' | 'error' | 'info'
 interface Toast { id: string; type: ToastType; message: string }
 
@@ -89,6 +92,13 @@ function JsonTree({ data, label }: { data: JsonValue; label?: string }) {
   )
 }
 
+function TypeBadge({ type }: { type: string }) {
+  const map: Record<string, string> = {
+    string: '🔤', number: '🔢', date: '📅', boolean: '☑️', currency: '💰',
+  }
+  return <span className={`type-badge type-${type}`}>{map[type] ?? '❓'} {type}</span>
+}
+
 function ConfidenceBar({ value }: { value: number }) {
   const pct = Math.round(value * 100)
   const cls = value >= 0.85 ? 'bar-high' : value >= 0.65 ? 'bar-mid' : 'bar-low'
@@ -132,6 +142,8 @@ function App() {
   const [jobs, setJobs] = useState<Job[]>([])
   const [toasts, setToasts] = useState<Toast[]>([])
   const [mappings, setMappings] = useState<MappingEntry[]>([])
+  const [columnStates, setColumnStates] = useState<Record<string, ColumnState>>({})
+  const [reviewMode, setReviewMode] = useState<ReviewMode>('cards')
   const [showEventLog, setShowEventLog] = useState(false)
   const [showRawResult, setShowRawResult] = useState(false)
   const [showApiConfig, setShowApiConfig] = useState(false)
@@ -266,7 +278,10 @@ function App() {
       if (data.status !== 'ok') { setInferenceStatus('error'); addToast('error', data.message || 'Inference failed.'); return }
       setAnalysis(data.analysis || null)
       setInferenceStatus('ok')
-      const cols = data.analysis?.schema_inference?.columns ?? []
+      const cols: ColumnInference[] = data.analysis?.schema_inference?.columns ?? []
+      const initStates: Record<string, ColumnState> = {}
+      cols.forEach(c => { initStates[c.source_name] = 'pending' })
+      setColumnStates(initStates)
       addToast('success', `Schema inferred — ${cols.length} columns detected!`)
     } catch { setInferenceStatus('error'); addToast('error', 'Network error during inference.') }
   }
@@ -300,7 +315,7 @@ function App() {
   function handleSelectJob(id: string) {
     setJobId(id); setAnalysis(null)
     setInferenceStatus('idle'); setEmbeddingStatus('idle')
-    setMappings([])
+    setMappings([]); setColumnStates({})
     setTimeout(handleRefresh, 50)
   }
 
@@ -309,11 +324,35 @@ function App() {
     if (jobId === id) {
       setJobId(''); setStatus('idle'); setTaskStatus(null); setStep(null)
       setResult(null); setAnalysis(null); setError(null)
-      setInferenceStatus('idle'); setEmbeddingStatus('idle'); setMappings([])
+      setInferenceStatus('idle'); setEmbeddingStatus('idle')
+      setMappings([]); setColumnStates({})
     }
     fetchJobs()
     addToast('info', 'Job deleted.')
   }
+
+  // ── Card-view helpers ─────────────────────────────────────────────────────
+  function acceptColumn(name: string) {
+    setColumnStates(prev => ({ ...prev, [name]: 'accepted' }))
+  }
+  function rejectColumn(name: string) {
+    setColumnStates(prev => ({ ...prev, [name]: 'rejected' }))
+  }
+  function acceptAllCards() {
+    const next: Record<string, ColumnState> = {}
+    columns.forEach(c => { next[c.source_name] = 'accepted' })
+    setColumnStates(next)
+    addToast('success', `All ${columns.length} columns accepted!`)
+  }
+
+  // Sync card-view accepted/rejected state into the shared mappings array
+  // so that Step 5 stats reflect card-view decisions too
+  const cardMappings: MappingEntry[] = columns.map(col => ({
+    source:     col.source_name,
+    target:     col.suggested_name,
+    confidence: col.confidence,
+    accepted:   columnStates[col.source_name] === 'accepted',
+  }))
 
   // ── Render ────────────────────────────────────────────────────────────────
 
@@ -468,12 +507,32 @@ function App() {
             </section>
           )}
 
-          {/* ── Step 4: Schema Review — React Flow visual mapper ── */}
+          {/* ── Step 4: Schema Review — Card or Map view ── */}
           {currentStep === 4 && columns.length > 0 && (
-            <section className="panel panel-mapper">
-              <div className="panel-title">
-                <span className="step-badge">Step 3</span>
-                Visual Schema Mapper
+            <section className={`panel ${reviewMode === 'map' ? 'panel-mapper' : ''}`}>
+
+              {/* Title + view toggle */}
+              <div className="panel-title panel-title-row">
+                <div>
+                  <span className="step-badge">Step 3</span>
+                  Review Schema Mapping
+                </div>
+                <div className="view-toggle">
+                  <button
+                    className={`view-toggle-btn ${reviewMode === 'cards' ? 'view-toggle-active' : ''}`}
+                    onClick={() => setReviewMode('cards')}
+                    title="Card view — readable detail cards with accept/reject"
+                  >
+                    ☰ Cards
+                  </button>
+                  <button
+                    className={`view-toggle-btn ${reviewMode === 'map' ? 'view-toggle-active' : ''}`}
+                    onClick={() => setReviewMode('map')}
+                    title="Map view — visual drag-and-drop flow diagram"
+                  >
+                    ⬡ Map
+                  </button>
+                </div>
               </div>
 
               {/* Health Score Banner */}
@@ -483,7 +542,11 @@ function App() {
                   <div>
                     <div className="health-title">Data Health Score — {healthLabel}</div>
                     <div className="health-sub">
-                      {columns.length} columns · {mappings.filter(m => m.accepted).length}/{mappings.length} accepted
+                      {columns.length} columns ·{' '}
+                      {reviewMode === 'cards'
+                        ? `${Object.values(columnStates).filter(s => s === 'accepted').length} accepted · ${Object.values(columnStates).filter(s => s === 'rejected').length} rejected`
+                        : `${mappings.filter(m => m.accepted).length}/${mappings.length} accepted`
+                      }
                     </div>
                   </div>
                 </div>
@@ -499,34 +562,77 @@ function App() {
                 </div>
               )}
 
-              {/* React Flow schema mapper */}
-              <SchemaMapper columns={columns} onMappingsChange={setMappings} />
-
-              {/* Accepted mappings summary table */}
-              {mappings.some(m => m.accepted) && (
-                <div className="mapping-summary">
-                  <div className="mapping-summary-title">Accepted Mappings</div>
-                  <table className="mapping-table">
-                    <thead>
-                      <tr><th>Source</th><th>→</th><th>Target</th><th>Confidence</th></tr>
-                    </thead>
-                    <tbody>
-                      {mappings.filter(m => m.accepted).map(m => (
-                        <tr key={`${m.source}-${m.target}`}>
-                          <td><code>{m.source}</code></td>
-                          <td className="arrow-cell">→</td>
-                          <td><code>{m.target}</code></td>
-                          <td>
-                            <ConfidenceBar value={m.confidence} />
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+              {/* ── CARD VIEW ── */}
+              {reviewMode === 'cards' && (
+                <>
+                  <div className="column-cards-header">
+                    <span>{columns.length} columns</span>
+                    <button className="btn-accept-all" onClick={acceptAllCards}>✅ Accept All</button>
+                  </div>
+                  <div className="column-cards">
+                    {columns.map(col => {
+                      const state = columnStates[col.source_name] ?? 'pending'
+                      return (
+                        <div key={col.source_name} className={`col-card col-card-${state}`}>
+                          <div className="col-card-top">
+                            <div className="col-mapping">
+                              <span className="col-source">{col.source_name}</span>
+                              <span className="col-arrow">→</span>
+                              <span className="col-target">{col.suggested_name}</span>
+                            </div>
+                            <TypeBadge type={col.inferred_type} />
+                          </div>
+                          <div className="col-desc">{col.description}</div>
+                          <ConfidenceBar value={col.confidence} />
+                          <div className="col-actions">
+                            {state === 'accepted' ? (
+                              <span className="col-accepted">✅ Accepted</span>
+                            ) : state === 'rejected' ? (
+                              <span className="col-rejected">❌ Rejected</span>
+                            ) : (
+                              <>
+                                <button className="btn-accept" onClick={() => acceptColumn(col.source_name)}>✓ Accept</button>
+                                <button className="btn-reject" onClick={() => rejectColumn(col.source_name)}>✕ Reject</button>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </>
               )}
 
-              {/* Confirm + Embed */}
+              {/* ── MAP VIEW ── */}
+              {reviewMode === 'map' && (
+                <>
+                  <SchemaMapper columns={columns} onMappingsChange={setMappings} />
+
+                  {/* Accepted mappings summary table */}
+                  {mappings.some(m => m.accepted) && (
+                    <div className="mapping-summary">
+                      <div className="mapping-summary-title">Accepted Mappings</div>
+                      <table className="mapping-table">
+                        <thead>
+                          <tr><th>Source</th><th>→</th><th>Target</th><th>Confidence</th></tr>
+                        </thead>
+                        <tbody>
+                          {mappings.filter(m => m.accepted).map(m => (
+                            <tr key={`${m.source}-${m.target}`}>
+                              <td><code>{m.source}</code></td>
+                              <td className="arrow-cell">→</td>
+                              <td><code>{m.target}</code></td>
+                              <td><ConfidenceBar value={m.confidence} /></td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </>
+              )}
+
+              {/* Confirm + Embed (both views) */}
               <div className="review-actions">
                 <button className="btn-primary" onClick={handleSelectSchema}>
                   💾 Confirm Schema
@@ -561,14 +667,14 @@ function App() {
                 <div>
                   <div className="done-title">Schema Weaved Successfully!</div>
                   <div className="done-sub">
-                    {mappings.filter(m => m.accepted).length} mappings accepted · {mappings.filter(m => !m.accepted).length} pending · embeddings stored
+                    {(reviewMode === 'cards' ? cardMappings : mappings).filter(m => m.accepted).length} columns accepted · embeddings stored
                   </div>
                 </div>
               </div>
               <div className="done-stats">
                 <div className="stat-card">
-                  <div className="stat-num">{mappings.filter(m => m.accepted).length}</div>
-                  <div className="stat-lbl">Mappings</div>
+                  <div className="stat-num">{(reviewMode === 'cards' ? cardMappings : mappings).filter(m => m.accepted).length}</div>
+                  <div className="stat-lbl">Accepted</div>
                 </div>
                 <div className="stat-card">
                   <div className="stat-num">{columns.length}</div>
