@@ -32,6 +32,13 @@ interface Job {
 
 type ColumnState = 'pending' | 'accepted' | 'rejected'
 type ReviewMode = 'cards' | 'map'
+type AsyncStatus = 'idle' | 'running' | 'ok' | 'error'
+
+interface CleanedPreview {
+  columns: string[]
+  sample_rows: Record<string, string>[]
+  row_count: number
+}
 
 type ToastType = 'success' | 'error' | 'info'
 interface Toast { id: string; type: ToastType; message: string }
@@ -39,11 +46,12 @@ interface Toast { id: string; type: ToastType; message: string }
 // ─── Step definitions ─────────────────────────────────────────────────────────
 
 const STEPS = [
-  { id: 1, label: 'Upload',  icon: '📁' },
-  { id: 2, label: 'Parse',   icon: '⚙️' },
-  { id: 3, label: 'Infer',   icon: '🧠' },
-  { id: 4, label: 'Review',  icon: '🔗' },
-  { id: 5, label: 'Export',  icon: '📤' },
+  { id: 1, label: 'Upload',     icon: '📁' },
+  { id: 2, label: 'Parse',      icon: '⚙️' },
+  { id: 3, label: 'Infer',      icon: '🧠' },
+  { id: 4, label: 'Review',     icon: '🔗' },
+  { id: 5, label: 'Transform',  icon: '⚗️' },
+  { id: 6, label: 'Export',     icon: '📤' },
 ]
 
 // ─── Small helpers ────────────────────────────────────────────────────────────
@@ -144,6 +152,12 @@ function App() {
   const [mappings, setMappings] = useState<MappingEntry[]>([])
   const [columnStates, setColumnStates] = useState<Record<string, ColumnState>>({})
   const [reviewMode, setReviewMode] = useState<ReviewMode>('cards')
+  const [generateStatus, setGenerateStatus] = useState<AsyncStatus>('idle')
+  const [executeStatus, setExecuteStatus] = useState<AsyncStatus>('idle')
+  const [generatedCode, setGeneratedCode] = useState<string>('')
+  const [sandboxLog, setSandboxLog] = useState<string>('')
+  const [cleanedPreview, setCleanedPreview] = useState<CleanedPreview | null>(null)
+  const [codeEdited, setCodeEdited] = useState(false)
   const [showEventLog, setShowEventLog] = useState(false)
   const [showRawResult, setShowRawResult] = useState(false)
   const [showApiConfig, setShowApiConfig] = useState(false)
@@ -172,15 +186,15 @@ function App() {
   const healthClass = overallHealth >= 0.9 ? 'health-excellent' : overallHealth >= 0.75 ? 'health-good'
     : overallHealth >= 0.6 ? 'health-fair' : 'health-poor'
 
-  // ── Current wizard step ────────────────────────────────────────────────────
+  // ── Current wizard step (6-step) ──────────────────────────────────────────
   const currentStep = useMemo(() => {
     if (status === 'idle' || status === 'uploading' || status === 'upload_failed') return 1
     if (status === 'queued' || status === 'processing') return 2
     if (status === 'completed' && inferenceStatus !== 'ok') return 3
-    if (inferenceStatus === 'ok' && embeddingStatus !== 'ok') return 4
-    if (embeddingStatus === 'ok') return 5
-    return 3
-  }, [status, inferenceStatus, embeddingStatus])
+    if (inferenceStatus === 'ok' && executeStatus !== 'ok') return 4
+    if (executeStatus === 'ok') return 6
+    return 4
+  }, [status, inferenceStatus, executeStatus])
 
   // ── SSE stream ────────────────────────────────────────────────────────────
   const statusUrl = useMemo(() => jobId ? `${apiBase}/api/v1/jobs/${jobId}/status/stream` : '', [apiBase, jobId])
@@ -312,10 +326,61 @@ function App() {
     } catch { setEmbeddingStatus('error'); addToast('error', 'Network error during embedding.') }
   }
 
+  async function handleGenerate() {
+    if (!jobId) return
+    setGenerateStatus('running')
+    addToast('info', 'Generating cleaning script with GPT...')
+    try {
+      const res = await fetch(`${apiBase}/api/v1/jobs/${jobId}/generate`, { method: 'POST' })
+      if (!res.ok) { setGenerateStatus('error'); addToast('error', 'Code generation failed.'); return }
+      const data = await res.json()
+      if (data.status !== 'ok') { setGenerateStatus('error'); addToast('error', data.message || 'Code generation failed.'); return }
+      setGeneratedCode(data.code)
+      setCodeEdited(false)
+      setAnalysis(data.analysis)
+      setGenerateStatus('ok')
+      addToast('success', 'Cleaning script generated! Review and run it. ⚗️')
+    } catch { setGenerateStatus('error'); addToast('error', 'Network error during code generation.') }
+  }
+
+  async function handleExecute() {
+    if (!jobId) return
+    setExecuteStatus('running')
+    setSandboxLog('')
+    setCleanedPreview(null)
+    addToast('info', 'Running script in Docker sandbox...')
+    try {
+      const body = codeEdited ? JSON.stringify({ code: generatedCode }) : '{}'
+      const res = await fetch(`${apiBase}/api/v1/jobs/${jobId}/execute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      })
+      if (!res.ok) { setExecuteStatus('error'); addToast('error', 'Execution request failed.'); return }
+      const data = await res.json()
+      setSandboxLog(data.sandbox_log || '')
+      setAnalysis(data.analysis || analysis)
+      if (data.status !== 'ok' || !data.cleaned_preview) {
+        setExecuteStatus('error')
+        addToast('error', 'Sandbox execution failed — check log for details.')
+        return
+      }
+      setCleanedPreview(data.cleaned_preview)
+      setExecuteStatus('ok')
+      addToast('success', `✅ ${data.cleaned_preview.row_count} rows cleaned successfully!`)
+    } catch { setExecuteStatus('error'); addToast('error', 'Network error during execution.') }
+  }
+
+  function resetAll() {
+    setGenerateStatus('idle'); setExecuteStatus('idle')
+    setGeneratedCode(''); setSandboxLog(''); setCleanedPreview(null); setCodeEdited(false)
+  }
+
   function handleSelectJob(id: string) {
     setJobId(id); setAnalysis(null)
     setInferenceStatus('idle'); setEmbeddingStatus('idle')
     setMappings([]); setColumnStates({})
+    resetAll()
     setTimeout(handleRefresh, 50)
   }
 
@@ -326,6 +391,7 @@ function App() {
       setResult(null); setAnalysis(null); setError(null)
       setInferenceStatus('idle'); setEmbeddingStatus('idle')
       setMappings([]); setColumnStates({})
+      resetAll()
     }
     fetchJobs()
     addToast('info', 'Job deleted.')
@@ -345,14 +411,7 @@ function App() {
     addToast('success', `All ${columns.length} columns accepted!`)
   }
 
-  // Sync card-view accepted/rejected state into the shared mappings array
-  // so that Step 5 stats reflect card-view decisions too
-  const cardMappings: MappingEntry[] = columns.map(col => ({
-    source:     col.source_name,
-    target:     col.suggested_name,
-    confidence: col.confidence,
-    accepted:   columnStates[col.source_name] === 'accepted',
-  }))
+
 
   // ── Render ────────────────────────────────────────────────────────────────
 
@@ -655,29 +714,143 @@ function App() {
             </section>
           )}
 
-          {/* ── Step 5: Export/Done ── */}
-          {currentStep === 5 && (
+          {/* ── Step 5: Transform — code gen + sandbox execution ── */}
+          {currentStep >= 4 && currentStep < 6 && inferenceStatus === 'ok' && (
             <section className="panel">
               <div className="panel-title">
-                <span className="step-badge step-badge-done">Step 4</span>
+                <span className="step-badge">Step 4</span>
+                Generate &amp; Execute Cleaning Script
+              </div>
+
+              {/* Generate button */}
+              {generateStatus === 'idle' && (
+                <div className="transform-intro">
+                  <p>Schema confirmed ✅  GPT will now write a pandas script to clean and normalise your data.</p>
+                  <button className="btn-primary btn-full" onClick={handleGenerate}>
+                    ⚗️ Generate Cleaning Script
+                  </button>
+                </div>
+              )}
+              {generateStatus === 'running' && (
+                <div className="progress-banner">
+                  <div className="progress-bar-indeterminate" />
+                  <span>GPT is writing your cleaning script…</span>
+                </div>
+              )}
+              {generateStatus === 'error' && (
+                <div className="error-banner">
+                  ❌ Code generation failed.
+                  <button className="btn-ghost btn-sm" onClick={handleGenerate}>Retry</button>
+                </div>
+              )}
+
+              {/* Code viewer / editor */}
+              {(generateStatus === 'ok' || generatedCode) && (
+                <>
+                  <div className="code-block-header">
+                    <span className="code-block-title">🐍 Generated Python Script {codeEdited && <span className="code-edited-badge">edited</span>}</span>
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <button className="btn-ghost btn-sm" onClick={() => { setGeneratedCode(''); setGenerateStatus('idle'); setCodeEdited(false) }}>↺ Regenerate</button>
+                      <button className="btn-ghost btn-sm" onClick={() => navigator.clipboard?.writeText(generatedCode)}>⎘ Copy</button>
+                    </div>
+                  </div>
+                  <textarea
+                    className="code-block-editor"
+                    value={generatedCode}
+                    onChange={e => { setGeneratedCode(e.target.value); setCodeEdited(true) }}
+                    spellCheck={false}
+                    rows={Math.min(generatedCode.split('\n').length + 2, 30)}
+                  />
+
+                  {/* Run button */}
+                  {executeStatus !== 'ok' && (
+                    <button
+                      className="btn-primary btn-full"
+                      onClick={handleExecute}
+                      disabled={executeStatus === 'running' || !generatedCode}
+                    >
+                      {executeStatus === 'running' ? '⏳ Running in sandbox…' : '▶ Run in Docker Sandbox'}
+                    </button>
+                  )}
+                  {executeStatus === 'running' && (
+                    <div className="progress-banner">
+                      <div className="progress-bar-indeterminate" />
+                      <span>Executing in isolated Docker container…</span>
+                    </div>
+                  )}
+                  {executeStatus === 'error' && (
+                    <div className="error-banner">
+                      ❌ Execution failed.
+                      <button className="btn-ghost btn-sm" onClick={handleExecute}>Retry</button>
+                    </div>
+                  )}
+                </>
+              )}
+
+              {/* Sandbox log */}
+              {sandboxLog && (
+                <details className="sandbox-log-wrap">
+                  <summary className="sandbox-log-title">📋 Sandbox log</summary>
+                  <pre className="sandbox-log">{sandboxLog}</pre>
+                </details>
+              )}
+
+              {/* Cleaned data preview */}
+              {cleanedPreview && (
+                <div className="cleaned-preview">
+                  <div className="cleaned-preview-header">
+                    <span>✅ {cleanedPreview.row_count} rows cleaned · {cleanedPreview.columns.length} columns</span>
+                    <a
+                      href={`${apiBase}/api/v1/jobs/${jobId}/download`}
+                      className="btn-primary btn-sm"
+                      download
+                    >
+                      ⬇ Download CSV
+                    </a>
+                  </div>
+                  <div className="cleaned-table-wrap">
+                    <table className="cleaned-table">
+                      <thead>
+                        <tr>{cleanedPreview.columns.map(c => <th key={c}>{c}</th>)}</tr>
+                      </thead>
+                      <tbody>
+                        {cleanedPreview.sample_rows.map((row, i) => (
+                          <tr key={i}>
+                            {cleanedPreview.columns.map(c => <td key={c}>{row[c] ?? ''}</td>)}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <p className="cleaned-note">Showing first {cleanedPreview.sample_rows.length} of {cleanedPreview.row_count} rows</p>
+                </div>
+              )}
+            </section>
+          )}
+
+          {/* ── Step 6: Done ── */}
+          {currentStep === 6 && (
+            <section className="panel">
+              <div className="panel-title">
+                <span className="step-badge step-badge-done">Done</span>
                 Pipeline Complete 🎉
               </div>
               <div className="done-banner">
                 <div className="done-icon">🎯</div>
                 <div>
-                  <div className="done-title">Schema Weaved Successfully!</div>
+                  <div className="done-title">Data Weaved Successfully!</div>
                   <div className="done-sub">
-                    {(reviewMode === 'cards' ? cardMappings : mappings).filter(m => m.accepted).length} columns accepted · embeddings stored
+                    {cleanedPreview?.row_count ?? 0} rows cleaned · {cleanedPreview?.columns.length ?? 0} columns · ready to download
                   </div>
                 </div>
               </div>
               <div className="done-stats">
                 <div className="stat-card">
-                  <div className="stat-num">{(reviewMode === 'cards' ? cardMappings : mappings).filter(m => m.accepted).length}</div>
-                  <div className="stat-lbl">Accepted</div>
+                  <div className="stat-num">{cleanedPreview?.row_count ?? '—'}</div>
+                  <div className="stat-lbl">Rows</div>
                 </div>
                 <div className="stat-card">
-                  <div className="stat-num">{columns.length}</div>
+                  <div className="stat-num">{cleanedPreview?.columns.length ?? '—'}</div>
                   <div className="stat-lbl">Columns</div>
                 </div>
                 <div className="stat-card">
@@ -685,9 +858,17 @@ function App() {
                   <div className="stat-lbl">Health Score</div>
                 </div>
               </div>
-              <button className="btn-outline btn-full" onClick={() => {
+              <a
+                href={`${apiBase}/api/v1/jobs/${jobId}/download`}
+                className="btn-primary btn-full"
+                download
+              >
+                ⬇ Download Cleaned CSV
+              </a>
+              <button className="btn-outline btn-full" style={{ marginTop: 10 }} onClick={() => {
                 setStatus('idle'); setJobId(''); setInferenceStatus('idle')
                 setEmbeddingStatus('idle'); setMappings([]); setFile(null)
+                resetAll()
               }}>
                 ➕ Process Another File
               </button>
