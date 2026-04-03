@@ -1,5 +1,8 @@
 import { useEffect, useMemo, useState, useCallback } from 'react'
+import type { ReactElement } from 'react'
 import './App.css'
+import { SchemaMapper } from './SchemaMapper'
+import type { MappingEntry } from './SchemaMapper'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -26,7 +29,6 @@ interface Job {
   created_at: string | null
 }
 
-type ColumnState = 'pending' | 'accepted' | 'rejected'
 
 type ToastType = 'success' | 'error' | 'info'
 interface Toast { id: string; type: ToastType; message: string }
@@ -48,7 +50,7 @@ function JsonTree({ data, label }: { data: JsonValue; label?: string }) {
   function toggle(path: string) {
     setCollapsed(prev => ({ ...prev, [path]: !prev[path] }))
   }
-  function renderValue(value: JsonValue, path: string): JSX.Element {
+  function renderValue(value: JsonValue, path: string): ReactElement {
     if (value === null) return <span className="json-null">null</span>
     if (typeof value === 'string') return <span className="json-string">"{value}"</span>
     if (typeof value === 'number') return <span className="json-number">{value}</span>
@@ -98,12 +100,6 @@ function ConfidenceBar({ value }: { value: number }) {
   )
 }
 
-function TypeBadge({ type }: { type: string }) {
-  const map: Record<string, string> = {
-    string: '🔤', number: '🔢', date: '📅', boolean: '☑️',
-  }
-  return <span className={`type-badge type-${type}`}>{map[type] ?? '❓'} {type}</span>
-}
 
 function ToastContainer({ toasts, dismiss }: { toasts: Toast[]; dismiss: (id: string) => void }) {
   return (
@@ -134,8 +130,8 @@ function App() {
   const [inferenceStatus, setInferenceStatus] = useState<'idle' | 'running' | 'ok' | 'error'>('idle')
   const [embeddingStatus, setEmbeddingStatus] = useState<'idle' | 'running' | 'ok' | 'error'>('idle')
   const [jobs, setJobs] = useState<Job[]>([])
-  const [columnStates, setColumnStates] = useState<Record<string, ColumnState>>({})
   const [toasts, setToasts] = useState<Toast[]>([])
+  const [mappings, setMappings] = useState<MappingEntry[]>([])
   const [showEventLog, setShowEventLog] = useState(false)
   const [showRawResult, setShowRawResult] = useState(false)
   const [showApiConfig, setShowApiConfig] = useState(false)
@@ -163,10 +159,6 @@ function App() {
     : overallHealth >= 0.6 ? 'Fair' : 'Needs Review'
   const healthClass = overallHealth >= 0.9 ? 'health-excellent' : overallHealth >= 0.75 ? 'health-good'
     : overallHealth >= 0.6 ? 'health-fair' : 'health-poor'
-
-  const acceptedCount = Object.values(columnStates).filter(s => s === 'accepted').length
-  const rejectedCount = Object.values(columnStates).filter(s => s === 'rejected').length
-  const reviewedCount = acceptedCount + rejectedCount
 
   // ── Current wizard step ────────────────────────────────────────────────────
   const currentStep = useMemo(() => {
@@ -250,7 +242,6 @@ function App() {
     setStatus('uploading')
     setResult(null); setAnalysis(null); setError(null)
     setInferenceStatus('idle'); setEmbeddingStatus('idle')
-    setColumnStates({})
     const form = new FormData()
     form.append('file', file)
     try {
@@ -276,9 +267,6 @@ function App() {
       setAnalysis(data.analysis || null)
       setInferenceStatus('ok')
       const cols = data.analysis?.schema_inference?.columns ?? []
-      const initial: Record<string, ColumnState> = {}
-      cols.forEach((c: ColumnInference) => { initial[c.source_name] = 'pending' })
-      setColumnStates(initial)
       addToast('success', `Schema inferred — ${cols.length} columns detected!`)
     } catch { setInferenceStatus('error'); addToast('error', 'Network error during inference.') }
   }
@@ -312,7 +300,7 @@ function App() {
   function handleSelectJob(id: string) {
     setJobId(id); setAnalysis(null)
     setInferenceStatus('idle'); setEmbeddingStatus('idle')
-    setColumnStates({})
+    setMappings([])
     setTimeout(handleRefresh, 50)
   }
 
@@ -321,23 +309,10 @@ function App() {
     if (jobId === id) {
       setJobId(''); setStatus('idle'); setTaskStatus(null); setStep(null)
       setResult(null); setAnalysis(null); setError(null)
-      setInferenceStatus('idle'); setEmbeddingStatus('idle'); setColumnStates({})
+      setInferenceStatus('idle'); setEmbeddingStatus('idle'); setMappings([])
     }
     fetchJobs()
     addToast('info', 'Job deleted.')
-  }
-
-  function acceptColumn(name: string) {
-    setColumnStates(prev => ({ ...prev, [name]: 'accepted' }))
-  }
-  function rejectColumn(name: string) {
-    setColumnStates(prev => ({ ...prev, [name]: 'rejected' }))
-  }
-  function acceptAll() {
-    const next: Record<string, ColumnState> = {}
-    columns.forEach(c => { next[c.source_name] = 'accepted' })
-    setColumnStates(next)
-    addToast('success', `All ${columns.length} columns accepted!`)
   }
 
   // ── Render ────────────────────────────────────────────────────────────────
@@ -493,21 +468,23 @@ function App() {
             </section>
           )}
 
-          {/* ── Step 4: Schema Review (THE GAMIFIED PART) ── */}
+          {/* ── Step 4: Schema Review — React Flow visual mapper ── */}
           {currentStep === 4 && columns.length > 0 && (
-            <section className="panel">
+            <section className="panel panel-mapper">
               <div className="panel-title">
                 <span className="step-badge">Step 3</span>
-                Review AI Schema Mapping
+                Visual Schema Mapper
               </div>
 
-              {/* Health Score */}
+              {/* Health Score Banner */}
               <div className={`health-banner ${healthClass}`}>
                 <div className="health-score-wrap">
                   <div className="health-score">{Math.round(overallHealth * 100)}%</div>
                   <div>
                     <div className="health-title">Data Health Score — {healthLabel}</div>
-                    <div className="health-sub">{columns.length} columns · {reviewedCount}/{columns.length} reviewed</div>
+                    <div className="health-sub">
+                      {columns.length} columns · {mappings.filter(m => m.accepted).length}/{mappings.length} accepted
+                    </div>
                   </div>
                 </div>
                 <div className="health-bar-outer">
@@ -522,42 +499,32 @@ function App() {
                 </div>
               )}
 
-              {/* Column cards */}
-              <div className="column-cards-header">
-                <span>{columns.length} columns</span>
-                <button className="btn-accept-all" onClick={acceptAll}>✅ Accept All</button>
-              </div>
-              <div className="column-cards">
-                {columns.map(col => {
-                  const state = columnStates[col.source_name] ?? 'pending'
-                  return (
-                    <div key={col.source_name} className={`col-card col-card-${state}`}>
-                      <div className="col-card-top">
-                        <div className="col-mapping">
-                          <span className="col-source">{col.source_name}</span>
-                          <span className="col-arrow">→</span>
-                          <span className="col-target">{col.suggested_name}</span>
-                        </div>
-                        <TypeBadge type={col.inferred_type} />
-                      </div>
-                      <div className="col-desc">{col.description}</div>
-                      <ConfidenceBar value={col.confidence} />
-                      <div className="col-actions">
-                        {state === 'accepted' ? (
-                          <span className="col-accepted">✅ Accepted</span>
-                        ) : state === 'rejected' ? (
-                          <span className="col-rejected">❌ Rejected</span>
-                        ) : (
-                          <>
-                            <button className="btn-accept" onClick={() => acceptColumn(col.source_name)}>✓ Accept</button>
-                            <button className="btn-reject" onClick={() => rejectColumn(col.source_name)}>✕ Reject</button>
-                          </>
-                        )}
-                      </div>
-                    </div>
-                  )
-                })}
-              </div>
+              {/* React Flow schema mapper */}
+              <SchemaMapper columns={columns} onMappingsChange={setMappings} />
+
+              {/* Accepted mappings summary table */}
+              {mappings.some(m => m.accepted) && (
+                <div className="mapping-summary">
+                  <div className="mapping-summary-title">Accepted Mappings</div>
+                  <table className="mapping-table">
+                    <thead>
+                      <tr><th>Source</th><th>→</th><th>Target</th><th>Confidence</th></tr>
+                    </thead>
+                    <tbody>
+                      {mappings.filter(m => m.accepted).map(m => (
+                        <tr key={`${m.source}-${m.target}`}>
+                          <td><code>{m.source}</code></td>
+                          <td className="arrow-cell">→</td>
+                          <td><code>{m.target}</code></td>
+                          <td>
+                            <ConfidenceBar value={m.confidence} />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
 
               {/* Confirm + Embed */}
               <div className="review-actions">
@@ -594,18 +561,18 @@ function App() {
                 <div>
                   <div className="done-title">Schema Weaved Successfully!</div>
                   <div className="done-sub">
-                    {acceptedCount} columns accepted · {rejectedCount} rejected · embeddings stored
+                    {mappings.filter(m => m.accepted).length} mappings accepted · {mappings.filter(m => !m.accepted).length} pending · embeddings stored
                   </div>
                 </div>
               </div>
               <div className="done-stats">
                 <div className="stat-card">
-                  <div className="stat-num">{acceptedCount}</div>
-                  <div className="stat-lbl">Accepted</div>
+                  <div className="stat-num">{mappings.filter(m => m.accepted).length}</div>
+                  <div className="stat-lbl">Mappings</div>
                 </div>
                 <div className="stat-card">
-                  <div className="stat-num">{rejectedCount}</div>
-                  <div className="stat-lbl">Rejected</div>
+                  <div className="stat-num">{columns.length}</div>
+                  <div className="stat-lbl">Columns</div>
                 </div>
                 <div className="stat-card">
                   <div className="stat-num">{Math.round(overallHealth * 100)}%</div>
@@ -614,7 +581,7 @@ function App() {
               </div>
               <button className="btn-outline btn-full" onClick={() => {
                 setStatus('idle'); setJobId(''); setInferenceStatus('idle')
-                setEmbeddingStatus('idle'); setColumnStates({}); setFile(null)
+                setEmbeddingStatus('idle'); setMappings([]); setFile(null)
               }}>
                 ➕ Process Another File
               </button>
