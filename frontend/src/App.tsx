@@ -1,40 +1,68 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, useCallback } from 'react'
 import './App.css'
 
-type JsonValue =
-  | string
-  | number
-  | boolean
-  | null
-  | JsonValue[]
-  | { [key: string]: JsonValue }
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue }
+
+interface ColumnInference {
+  source_name: string
+  inferred_type: string
+  suggested_name: string
+  description: string
+  confidence: number
+}
+
+interface SchemaInference {
+  columns: ColumnInference[]
+  notes?: string
+}
+
+interface Job {
+  job_id: string
+  filename: string
+  status: string
+  task_status: string | null
+  created_at: string | null
+}
+
+type ColumnState = 'pending' | 'accepted' | 'rejected'
+
+type ToastType = 'success' | 'error' | 'info'
+interface Toast { id: string; type: ToastType; message: string }
+
+// ─── Step definitions ─────────────────────────────────────────────────────────
+
+const STEPS = [
+  { id: 1, label: 'Upload',  icon: '📁' },
+  { id: 2, label: 'Parse',   icon: '⚙️' },
+  { id: 3, label: 'Infer',   icon: '🧠' },
+  { id: 4, label: 'Review',  icon: '🔗' },
+  { id: 5, label: 'Export',  icon: '📤' },
+]
+
+// ─── Small helpers ────────────────────────────────────────────────────────────
 
 function JsonTree({ data, label }: { data: JsonValue; label?: string }) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
-
   function toggle(path: string) {
-    setCollapsed((prev) => ({ ...prev, [path]: !prev[path] }))
+    setCollapsed(prev => ({ ...prev, [path]: !prev[path] }))
   }
-
   function renderValue(value: JsonValue, path: string): JSX.Element {
     if (value === null) return <span className="json-null">null</span>
     if (typeof value === 'string') return <span className="json-string">"{value}"</span>
     if (typeof value === 'number') return <span className="json-number">{value}</span>
     if (typeof value === 'boolean') return <span className="json-bool">{String(value)}</span>
-
     const isArray = Array.isArray(value)
     const keys = isArray ? value.map((_, i) => i) : Object.keys(value)
     const isCollapsed = collapsed[path]
-
     return (
       <div className="json-node">
-        <button className="json-toggle" onClick={() => toggle(path)}>
-          {isCollapsed ? '+' : '−'}
-        </button>
+        <button className="json-toggle" onClick={() => toggle(path)}>{isCollapsed ? '+' : '−'}</button>
         <span className="json-brace">{isArray ? '[' : '{'}</span>
         {!isCollapsed && (
           <div className="json-children">
-            {keys.map((key) => {
+            {keys.map(key => {
               const childPath = `${path}.${key}`
               const childValue = isArray ? value[key as number] : value[key as string]
               return (
@@ -51,7 +79,6 @@ function JsonTree({ data, label }: { data: JsonValue; label?: string }) {
       </div>
     )
   }
-
   return (
     <div className="json-tree">
       {label && <div className="label">{label}</div>}
@@ -60,10 +87,41 @@ function JsonTree({ data, label }: { data: JsonValue; label?: string }) {
   )
 }
 
-function App() {
-  const [apiBase, setApiBase] = useState(
-    import.meta.env.VITE_API_BASE || 'http://localhost:8000'
+function ConfidenceBar({ value }: { value: number }) {
+  const pct = Math.round(value * 100)
+  const cls = value >= 0.85 ? 'bar-high' : value >= 0.65 ? 'bar-mid' : 'bar-low'
+  return (
+    <div className="conf-bar-wrap">
+      <div className={`conf-bar ${cls}`} style={{ width: `${pct}%` }} />
+      <span className="conf-label">{pct}%</span>
+    </div>
   )
+}
+
+function TypeBadge({ type }: { type: string }) {
+  const map: Record<string, string> = {
+    string: '🔤', number: '🔢', date: '📅', boolean: '☑️',
+  }
+  return <span className={`type-badge type-${type}`}>{map[type] ?? '❓'} {type}</span>
+}
+
+function ToastContainer({ toasts, dismiss }: { toasts: Toast[]; dismiss: (id: string) => void }) {
+  return (
+    <div className="toast-container">
+      {toasts.map(t => (
+        <div key={t.id} className={`toast toast-${t.type}`} onClick={() => dismiss(t.id)}>
+          <span className="toast-icon">{t.type === 'success' ? '✅' : t.type === 'error' ? '❌' : 'ℹ️'}</span>
+          <span>{t.message}</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// ─── Main App ─────────────────────────────────────────────────────────────────
+
+function App() {
+  const [apiBase, setApiBase] = useState(import.meta.env.VITE_API_BASE || 'http://localhost:8000')
   const [file, setFile] = useState<File | null>(null)
   const [jobId, setJobId] = useState('')
   const [status, setStatus] = useState('idle')
@@ -73,32 +131,63 @@ function App() {
   const [analysis, setAnalysis] = useState<object | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [events, setEvents] = useState<string[]>([])
-  const [resultExpanded, setResultExpanded] = useState(false)
-  const [previewExpanded, setPreviewExpanded] = useState(false)
-  const [analysisExpanded, setAnalysisExpanded] = useState(false)
   const [inferenceStatus, setInferenceStatus] = useState<'idle' | 'running' | 'ok' | 'error'>('idle')
-  const [inferenceError, setInferenceError] = useState<string | null>(null)
   const [embeddingStatus, setEmbeddingStatus] = useState<'idle' | 'running' | 'ok' | 'error'>('idle')
-  const [embeddingError, setEmbeddingError] = useState<string | null>(null)
-  const [jobs, setJobs] = useState<
-    { job_id: string; filename: string; status: string; task_status: string | null; created_at: string | null }[]
-  >([])
+  const [jobs, setJobs] = useState<Job[]>([])
+  const [columnStates, setColumnStates] = useState<Record<string, ColumnState>>({})
+  const [toasts, setToasts] = useState<Toast[]>([])
+  const [showEventLog, setShowEventLog] = useState(false)
+  const [showRawResult, setShowRawResult] = useState(false)
+  const [showApiConfig, setShowApiConfig] = useState(false)
 
-  const statusUrl = useMemo(() => {
-    return jobId ? `${apiBase}/api/v1/jobs/${jobId}/status/stream` : ''
-  }, [apiBase, jobId])
+  // ── Toast helpers ──────────────────────────────────────────────────────────
+  const addToast = useCallback((type: ToastType, message: string) => {
+    const id = `${Date.now()}-${Math.random()}`
+    setToasts(prev => [...prev, { id, type, message }])
+    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 4000)
+  }, [])
+  const dismissToast = useCallback((id: string) => {
+    setToasts(prev => prev.filter(t => t.id !== id))
+  }, [])
+
+  // ── Derived schema state ───────────────────────────────────────────────────
+  const schemaInference = (analysis as { schema_inference?: SchemaInference } | null)?.schema_inference
+  const selectedSchema  = (analysis as { selected_schema?: SchemaInference } | null)?.selected_schema
+  const columns: ColumnInference[] = schemaInference?.columns ?? []
+
+  const overallHealth = columns.length
+    ? columns.reduce((s, c) => s + c.confidence, 0) / columns.length
+    : 0
+
+  const healthLabel = overallHealth >= 0.9 ? 'Excellent' : overallHealth >= 0.75 ? 'Good'
+    : overallHealth >= 0.6 ? 'Fair' : 'Needs Review'
+  const healthClass = overallHealth >= 0.9 ? 'health-excellent' : overallHealth >= 0.75 ? 'health-good'
+    : overallHealth >= 0.6 ? 'health-fair' : 'health-poor'
+
+  const acceptedCount = Object.values(columnStates).filter(s => s === 'accepted').length
+  const rejectedCount = Object.values(columnStates).filter(s => s === 'rejected').length
+  const reviewedCount = acceptedCount + rejectedCount
+
+  // ── Current wizard step ────────────────────────────────────────────────────
+  const currentStep = useMemo(() => {
+    if (status === 'idle' || status === 'uploading' || status === 'upload_failed') return 1
+    if (status === 'queued' || status === 'processing') return 2
+    if (status === 'completed' && inferenceStatus !== 'ok') return 3
+    if (inferenceStatus === 'ok' && embeddingStatus !== 'ok') return 4
+    if (embeddingStatus === 'ok') return 5
+    return 3
+  }, [status, inferenceStatus, embeddingStatus])
+
+  // ── SSE stream ────────────────────────────────────────────────────────────
+  const statusUrl = useMemo(() => jobId ? `${apiBase}/api/v1/jobs/${jobId}/status/stream` : '', [apiBase, jobId])
 
   useEffect(() => {
     if (!statusUrl) return
     setEvents([])
     const source = new EventSource(statusUrl)
-    const pushEvent = (label: string, payload?: unknown) => {
-      const timestamp = new Date().toLocaleTimeString()
-      const message =
-        payload === undefined
-          ? `${timestamp} ${label}`
-          : `${timestamp} ${label}: ${JSON.stringify(payload)}`
-      setEvents((prev) => [message, ...prev].slice(0, 20))
+    const push = (label: string, payload?: unknown) => {
+      const ts = new Date().toLocaleTimeString()
+      setEvents(prev => [`${ts} ${label}${payload !== undefined ? ': ' + JSON.stringify(payload) : ''}`, ...prev].slice(0, 30))
     }
     source.addEventListener('status', (event) => {
       try {
@@ -107,90 +196,47 @@ function App() {
         setStatus(payload.status || 'unknown')
         setTaskStatus(payload.task_status ?? null)
         if (payload.step) setStep(payload.step)
-        pushEvent('status', payload)
-        if (payload.status === 'completed' || payload.status === 'failed') {
+        push('status', payload)
+        if (payload.status === 'completed') {
           handleRefresh()
+          addToast('success', 'File parsed successfully!')
         }
-      } catch {
-        pushEvent('status (invalid payload)')
-      }
-    })
-    source.addEventListener('heartbeat', () => {
-      pushEvent('heartbeat')
-    })
-    source.addEventListener('error', (event) => {
-      try {
-        const data = (event as MessageEvent).data
-        if (!data) {
-          pushEvent('error (connection)')
-          return
+        if (payload.status === 'failed') {
+          handleRefresh()
+          addToast('error', 'Processing failed.')
         }
-        const payload = JSON.parse(data)
-        pushEvent('error', payload)
-      } catch {
-        pushEvent('error (invalid payload)')
-      }
+      } catch { push('status (invalid payload)') }
     })
+    source.addEventListener('heartbeat', () => push('heartbeat'))
     source.addEventListener('result', (event) => {
       try {
         const payload = JSON.parse((event as MessageEvent).data)
         setResult(payload.result || null)
         setError(payload.error || null)
-        pushEvent('result', payload)
-        setStep(payload.result?.step || null)
-      } catch {
-        pushEvent('result (invalid payload)')
-      }
+        push('result', payload)
+      } catch { push('result (invalid payload)') }
     })
-    source.onerror = () => {
-      source.close()
-    }
+    source.onerror = () => source.close()
     return () => source.close()
   }, [statusUrl])
 
+  // ── API helpers ───────────────────────────────────────────────────────────
   async function fetchJobs() {
-    const response = await fetch(`${apiBase}/api/v1/jobs`)
-    if (!response.ok) return
-    const data = await response.json()
-    setJobs(data.jobs || [])
+    try {
+      const res = await fetch(`${apiBase}/api/v1/jobs`)
+      if (!res.ok) return
+      const data = await res.json()
+      setJobs(data.jobs || [])
+    } catch { /* network error */ }
   }
 
-  useEffect(() => {
-    fetchJobs()
-  }, [apiBase])
-
-  async function handleUpload() {
-    if (!file) return
-    setStatus('uploading')
-    setResult(null)
-    setAnalysis(null)
-    setError(null)
-    setResultExpanded(false)
-    setPreviewExpanded(false)
-    setAnalysisExpanded(false)
-    setInferenceStatus('idle')
-    setInferenceError(null)
-    const form = new FormData()
-    form.append('file', file)
-    const response = await fetch(`${apiBase}/api/v1/upload`, {
-      method: 'POST',
-      body: form,
-    })
-    if (!response.ok) {
-      setStatus('upload_failed')
-      return
-    }
-    const data = await response.json()
-    setJobId(data.job_id)
-    setStatus('queued')
-    fetchJobs()
-  }
+  useEffect(() => { fetchJobs() }, [apiBase])
 
   async function handleRefresh() {
     if (!jobId) return
-    const response = await fetch(`${apiBase}/api/v1/jobs/${jobId}`)
-    if (!response.ok) return
-    const data = await response.json()
+    const res = await fetch(`${apiBase}/api/v1/jobs/${jobId}`)
+    if (!res.ok) return
+    const data = await res.json()
     setStatus(data?.job?.status || 'unknown')
     setTaskStatus(data?.job?.task_status || null)
     setStep(data?.job?.step || null)
@@ -199,312 +245,437 @@ function App() {
     setError(data?.job?.error || null)
   }
 
-  const schemaInference = (analysis as { schema_inference?: JsonValue } | null)
-    ?.schema_inference
-  const selectedSchema = (analysis as { selected_schema?: JsonValue } | null)
-    ?.selected_schema
+  async function handleUpload() {
+    if (!file) return
+    setStatus('uploading')
+    setResult(null); setAnalysis(null); setError(null)
+    setInferenceStatus('idle'); setEmbeddingStatus('idle')
+    setColumnStates({})
+    const form = new FormData()
+    form.append('file', file)
+    try {
+      const res = await fetch(`${apiBase}/api/v1/upload`, { method: 'POST', body: form })
+      if (!res.ok) { setStatus('upload_failed'); addToast('error', 'Upload failed.'); return }
+      const data = await res.json()
+      setJobId(data.job_id)
+      setStatus('queued')
+      fetchJobs()
+      addToast('info', `Uploaded ${file.name} — processing...`)
+    } catch { setStatus('upload_failed'); addToast('error', 'Network error on upload.') }
+  }
 
   async function handleInfer() {
     if (!jobId) return
     setInferenceStatus('running')
-    setInferenceError(null)
-    const response = await fetch(`${apiBase}/api/v1/jobs/${jobId}/infer`, {
-      method: 'POST',
-    })
-    if (!response.ok) {
-      setInferenceStatus('error')
-      setInferenceError('Inference failed.')
-      return
-    }
-    const data = await response.json()
-    if (data.status !== 'ok') {
-      setInferenceStatus('error')
-      setInferenceError(data.message || 'Inference failed.')
-      return
-    }
-    setAnalysis(data.analysis || null)
-    setInferenceStatus('ok')
-    setAnalysisExpanded(true)
+    addToast('info', 'Running AI schema inference...')
+    try {
+      const res = await fetch(`${apiBase}/api/v1/jobs/${jobId}/infer`, { method: 'POST' })
+      if (!res.ok) { setInferenceStatus('error'); addToast('error', 'Inference request failed.'); return }
+      const data = await res.json()
+      if (data.status !== 'ok') { setInferenceStatus('error'); addToast('error', data.message || 'Inference failed.'); return }
+      setAnalysis(data.analysis || null)
+      setInferenceStatus('ok')
+      const cols = data.analysis?.schema_inference?.columns ?? []
+      const initial: Record<string, ColumnState> = {}
+      cols.forEach((c: ColumnInference) => { initial[c.source_name] = 'pending' })
+      setColumnStates(initial)
+      addToast('success', `Schema inferred — ${cols.length} columns detected!`)
+    } catch { setInferenceStatus('error'); addToast('error', 'Network error during inference.') }
   }
 
   async function handleSelectSchema() {
     if (!jobId) return
-    setInferenceStatus('running')
-    setInferenceError(null)
-    const response = await fetch(`${apiBase}/api/v1/jobs/${jobId}/schema/select`, {
-      method: 'POST',
-    })
-    if (!response.ok) {
-      setInferenceStatus('error')
-      setInferenceError('Schema selection failed.')
-      return
-    }
-    const data = await response.json()
-    if (data.status !== 'ok') {
-      setInferenceStatus('error')
-      setInferenceError(data.message || 'Schema selection failed.')
-      return
-    }
-    setAnalysis(data.analysis || null)
-    setInferenceStatus('ok')
-    setAnalysisExpanded(true)
+    try {
+      const res = await fetch(`${apiBase}/api/v1/jobs/${jobId}/schema/select`, { method: 'POST' })
+      if (!res.ok) { addToast('error', 'Schema confirmation failed.'); return }
+      const data = await res.json()
+      if (data.status !== 'ok') { addToast('error', data.message || 'Schema confirmation failed.'); return }
+      setAnalysis(data.analysis || null)
+      addToast('success', 'Schema confirmed ✓')
+    } catch { addToast('error', 'Network error.') }
   }
 
   async function handleBuildEmbeddings() {
     if (!jobId) return
     setEmbeddingStatus('running')
-    setEmbeddingError(null)
-    const response = await fetch(`${apiBase}/api/v1/jobs/${jobId}/schema/embeddings`, {
-      method: 'POST',
-    })
-    if (!response.ok) {
-      setEmbeddingStatus('error')
-      setEmbeddingError('Embedding build failed.')
-      return
-    }
-    const data = await response.json()
-    if (data.status !== 'ok') {
-      setEmbeddingStatus('error')
-      setEmbeddingError(data.message || 'Embedding build failed.')
-      return
-    }
-    setEmbeddingStatus('ok')
+    addToast('info', 'Building vector embeddings...')
+    try {
+      const res = await fetch(`${apiBase}/api/v1/jobs/${jobId}/schema/embeddings`, { method: 'POST' })
+      if (!res.ok) { setEmbeddingStatus('error'); addToast('error', 'Embedding build failed.'); return }
+      const data = await res.json()
+      if (data.status !== 'ok') { setEmbeddingStatus('error'); addToast('error', data.message || 'Embedding failed.'); return }
+      setEmbeddingStatus('ok')
+      addToast('success', 'Embeddings stored — semantic matching enabled! 🎯')
+    } catch { setEmbeddingStatus('error'); addToast('error', 'Network error during embedding.') }
   }
 
-  function handleSelectJob(selectedId: string) {
-    setJobId(selectedId)
-    setAnalysis(null)
-    setAnalysisExpanded(false)
-    setInferenceStatus('idle')
-    setInferenceError(null)
-    setEmbeddingStatus('idle')
-    setEmbeddingError(null)
-    handleRefresh()
+  function handleSelectJob(id: string) {
+    setJobId(id); setAnalysis(null)
+    setInferenceStatus('idle'); setEmbeddingStatus('idle')
+    setColumnStates({})
+    setTimeout(handleRefresh, 50)
   }
 
-  async function handleDeleteJob(selectedId: string) {
-    await fetch(`${apiBase}/api/v1/jobs/${selectedId}`, { method: 'DELETE' })
-    if (jobId === selectedId) {
-      setJobId('')
-      setStatus('idle')
-      setTaskStatus(null)
-      setStep(null)
-      setResult(null)
-      setAnalysis(null)
-      setError(null)
-      setInferenceStatus('idle')
-      setInferenceError(null)
-      setEmbeddingStatus('idle')
-      setEmbeddingError(null)
+  async function handleDeleteJob(id: string) {
+    await fetch(`${apiBase}/api/v1/jobs/${id}`, { method: 'DELETE' })
+    if (jobId === id) {
+      setJobId(''); setStatus('idle'); setTaskStatus(null); setStep(null)
+      setResult(null); setAnalysis(null); setError(null)
+      setInferenceStatus('idle'); setEmbeddingStatus('idle'); setColumnStates({})
     }
     fetchJobs()
+    addToast('info', 'Job deleted.')
   }
+
+  function acceptColumn(name: string) {
+    setColumnStates(prev => ({ ...prev, [name]: 'accepted' }))
+  }
+  function rejectColumn(name: string) {
+    setColumnStates(prev => ({ ...prev, [name]: 'rejected' }))
+  }
+  function acceptAll() {
+    const next: Record<string, ColumnState> = {}
+    columns.forEach(c => { next[c.source_name] = 'accepted' })
+    setColumnStates(next)
+    addToast('success', `All ${columns.length} columns accepted!`)
+  }
+
+  // ── Render ────────────────────────────────────────────────────────────────
 
   return (
     <div className="app">
-      <header>
-        <h1>Gamified Data Consolidator</h1>
-        <p>Upload a file and watch real-time status updates.</p>
+      <ToastContainer toasts={toasts} dismiss={dismissToast} />
+
+      {/* ── Header ── */}
+      <header className="app-header">
+        <div className="header-logo">
+          <span className="logo-icon">🪡</span>
+          <div>
+            <h1>Schema Weaver</h1>
+            <p>AI-native data consolidation — upload any file, get a clean schema.</p>
+          </div>
+        </div>
+        <button className="btn-ghost" onClick={() => setShowApiConfig(v => !v)}>
+          ⚙️ Config
+        </button>
       </header>
 
-      <section className="panel">
-        <label>
-          API Base URL
-          <input
-            type="text"
-            value={apiBase}
-            onChange={(event) => setApiBase(event.target.value)}
-            placeholder="http://localhost:8000"
-          />
-        </label>
+      {showApiConfig && (
+        <section className="panel panel-config">
+          <label className="config-label">
+            API Base URL
+            <input type="text" value={apiBase} onChange={e => setApiBase(e.target.value)} placeholder="http://localhost:8000" />
+          </label>
+        </section>
+      )}
+
+      {/* ── Step Wizard ── */}
+      <section className="panel step-wizard-panel">
+        <div className="step-wizard">
+          {STEPS.map((s, i) => {
+            const done = s.id < currentStep
+            const active = s.id === currentStep
+            return (
+              <div key={s.id} className={`step ${done ? 'step-done' : active ? 'step-active' : 'step-pending'}`}>
+                <div className="step-icon-wrap">
+                  <div className="step-icon">{done ? '✅' : s.icon}</div>
+                </div>
+                <div className="step-label">{s.label}</div>
+                {i < STEPS.length - 1 && <div className={`step-line ${done ? 'step-line-done' : ''}`} />}
+              </div>
+            )
+          })}
+        </div>
       </section>
 
-      <section className="panel">
-        <div className="panel-header">
-          <div className="label">Recent Jobs</div>
-          <button onClick={fetchJobs}>Reload List</button>
-        </div>
-        <ul className="jobs">
-          {jobs.length === 0 && <li>No jobs yet.</li>}
-          {jobs.map((job) => (
-            <li key={job.job_id}>
-              <div className={jobId === job.job_id ? 'job active' : 'job'}>
-                <button className="job-main" onClick={() => handleSelectJob(job.job_id)}>
-                  <div className="job-title">{job.filename}</div>
-                  <div className="job-meta">
-                    {job.status} / {job.task_status ?? '—'}
+      <div className="main-layout">
+        {/* ── Left: Recent Jobs ── */}
+        <aside className="panel jobs-panel">
+          <div className="panel-header">
+            <div className="label">Recent Jobs</div>
+            <button className="btn-ghost btn-sm" onClick={fetchJobs}>↻ Reload</button>
+          </div>
+          <ul className="jobs">
+            {jobs.length === 0 && <li className="no-jobs">No jobs yet.</li>}
+            {jobs.map(job => (
+              <li key={job.job_id}>
+                <div className={`job ${jobId === job.job_id ? 'job-active' : ''}`}>
+                  <button className="job-main" onClick={() => handleSelectJob(job.job_id)}>
+                    <div className="job-title">{job.filename}</div>
+                    <div className="job-meta">
+                      <span className={`status-dot status-${job.status}`} />
+                      {job.status}
+                    </div>
+                  </button>
+                  <button className="btn-danger btn-sm" onClick={() => handleDeleteJob(job.job_id)}>✕</button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </aside>
+
+        {/* ── Right: Main content ── */}
+        <div className="content-col">
+
+          {/* ── Step 1 & 2: Upload + Parse ── */}
+          {currentStep <= 2 && (
+            <section className="panel">
+              <div className="panel-title">
+                <span className="step-badge">Step 1</span>
+                Upload Your File
+              </div>
+              <div className="upload-zone">
+                <input
+                  type="file"
+                  id="file-input"
+                  accept=".csv,.xlsx,.xls,.pdf"
+                  onChange={e => setFile(e.target.files?.[0] || null)}
+                />
+                <label htmlFor="file-input" className="upload-label">
+                  {file ? (
+                    <>📄 <strong>{file.name}</strong><br /><small>{(file.size / 1024).toFixed(1)} KB</small></>
+                  ) : (
+                    <>📁 Choose a file<br /><small>CSV, Excel, or PDF</small></>
+                  )}
+                </label>
+              </div>
+              <button
+                className="btn-primary btn-full"
+                onClick={handleUpload}
+                disabled={!file || status === 'uploading' || status === 'queued' || status === 'processing'}
+              >
+                {status === 'uploading' ? '⏳ Uploading...'
+                  : status === 'queued' || status === 'processing' ? '⚙️ Parsing...'
+                  : '🚀 Upload & Parse'}
+              </button>
+
+              {(status === 'queued' || status === 'processing') && (
+                <div className="progress-banner">
+                  <div className="progress-bar-indeterminate" />
+                  <span>Parsing file… step: <strong>{step ?? '…'}</strong></span>
+                </div>
+              )}
+
+              {error && <div className="error-banner">❌ {error}</div>}
+            </section>
+          )}
+
+          {/* ── Step 3: AI Inference ── */}
+          {currentStep === 3 && (
+            <section className="panel">
+              <div className="panel-title">
+                <span className="step-badge">Step 2</span>
+                AI Schema Inference
+              </div>
+              <div className="parsed-summary">
+                <div className="summary-icon">✅</div>
+                <div>
+                  <div className="summary-title">File parsed successfully</div>
+                  <div className="summary-sub">
+                    {(result as { preview?: { row_count?: number; columns?: string[] } } | null)?.preview?.row_count ?? '?'} rows ·{' '}
+                    {(result as { preview?: { columns?: string[] } } | null)?.preview?.columns?.length ?? '?'} columns detected
                   </div>
+                </div>
+              </div>
+              <button
+                className="btn-primary btn-full"
+                onClick={handleInfer}
+                disabled={inferenceStatus === 'running'}
+              >
+                {inferenceStatus === 'running' ? '🧠 Analysing with AI...' : '🧠 Run AI Schema Inference'}
+              </button>
+              {inferenceStatus === 'running' && (
+                <div className="progress-banner">
+                  <div className="progress-bar-indeterminate" />
+                  <span>GPT-5 is reading your data…</span>
+                </div>
+              )}
+            </section>
+          )}
+
+          {/* ── Step 4: Schema Review (THE GAMIFIED PART) ── */}
+          {currentStep === 4 && columns.length > 0 && (
+            <section className="panel">
+              <div className="panel-title">
+                <span className="step-badge">Step 3</span>
+                Review AI Schema Mapping
+              </div>
+
+              {/* Health Score */}
+              <div className={`health-banner ${healthClass}`}>
+                <div className="health-score-wrap">
+                  <div className="health-score">{Math.round(overallHealth * 100)}%</div>
+                  <div>
+                    <div className="health-title">Data Health Score — {healthLabel}</div>
+                    <div className="health-sub">{columns.length} columns · {reviewedCount}/{columns.length} reviewed</div>
+                  </div>
+                </div>
+                <div className="health-bar-outer">
+                  <div className="health-bar-inner" style={{ width: `${overallHealth * 100}%` }} />
+                </div>
+              </div>
+
+              {/* Notes from LLM */}
+              {schemaInference?.notes && (
+                <div className="notes-banner">
+                  💡 <em>{schemaInference.notes}</em>
+                </div>
+              )}
+
+              {/* Column cards */}
+              <div className="column-cards-header">
+                <span>{columns.length} columns</span>
+                <button className="btn-accept-all" onClick={acceptAll}>✅ Accept All</button>
+              </div>
+              <div className="column-cards">
+                {columns.map(col => {
+                  const state = columnStates[col.source_name] ?? 'pending'
+                  return (
+                    <div key={col.source_name} className={`col-card col-card-${state}`}>
+                      <div className="col-card-top">
+                        <div className="col-mapping">
+                          <span className="col-source">{col.source_name}</span>
+                          <span className="col-arrow">→</span>
+                          <span className="col-target">{col.suggested_name}</span>
+                        </div>
+                        <TypeBadge type={col.inferred_type} />
+                      </div>
+                      <div className="col-desc">{col.description}</div>
+                      <ConfidenceBar value={col.confidence} />
+                      <div className="col-actions">
+                        {state === 'accepted' ? (
+                          <span className="col-accepted">✅ Accepted</span>
+                        ) : state === 'rejected' ? (
+                          <span className="col-rejected">❌ Rejected</span>
+                        ) : (
+                          <>
+                            <button className="btn-accept" onClick={() => acceptColumn(col.source_name)}>✓ Accept</button>
+                            <button className="btn-reject" onClick={() => rejectColumn(col.source_name)}>✕ Reject</button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+
+              {/* Confirm + Embed */}
+              <div className="review-actions">
+                <button className="btn-primary" onClick={handleSelectSchema}>
+                  💾 Confirm Schema
                 </button>
                 <button
-                  className="job-delete"
-                  onClick={() => handleDeleteJob(job.job_id)}
+                  className="btn-secondary"
+                  onClick={handleBuildEmbeddings}
+                  disabled={embeddingStatus === 'running' || !selectedSchema}
+                  title={!selectedSchema ? 'Confirm schema first' : ''}
                 >
-                  Delete
+                  {embeddingStatus === 'running' ? '⏳ Embedding...' : '🔮 Build Embeddings'}
                 </button>
               </div>
-            </li>
-          ))}
-        </ul>
-      </section>
+              {embeddingStatus === 'running' && (
+                <div className="progress-banner">
+                  <div className="progress-bar-indeterminate" />
+                  <span>Generating vector embeddings for semantic search…</span>
+                </div>
+              )}
+            </section>
+          )}
 
-      <section className="panel">
-        <label>
-          Select file
-          <input
-            type="file"
-            onChange={(event) => setFile(event.target.files?.[0] || null)}
-          />
-        </label>
-        <div className="actions">
-          <button onClick={handleUpload} disabled={!file}>
-            Upload
-          </button>
-          <button onClick={handleRefresh} disabled={!jobId}>
-            Refresh
-          </button>
-          <button
-            onClick={handleInfer}
-            disabled={!jobId || status !== 'completed' || inferenceStatus === 'running'}
-          >
-            {inferenceStatus === 'running' ? 'Inferring...' : 'Run Inference'}
-          </button>
-          <button
-            onClick={handleSelectSchema}
-            disabled={!schemaInference || inferenceStatus === 'running'}
-          >
-            Use This Schema
-          </button>
-          <button
-            onClick={handleBuildEmbeddings}
-            disabled={!schemaInference || embeddingStatus === 'running'}
-          >
-            {embeddingStatus === 'running' ? 'Embedding...' : 'Build Embeddings'}
-          </button>
-        </div>
-      </section>
+          {/* ── Step 5: Export/Done ── */}
+          {currentStep === 5 && (
+            <section className="panel">
+              <div className="panel-title">
+                <span className="step-badge step-badge-done">Step 4</span>
+                Pipeline Complete 🎉
+              </div>
+              <div className="done-banner">
+                <div className="done-icon">🎯</div>
+                <div>
+                  <div className="done-title">Schema Weaved Successfully!</div>
+                  <div className="done-sub">
+                    {acceptedCount} columns accepted · {rejectedCount} rejected · embeddings stored
+                  </div>
+                </div>
+              </div>
+              <div className="done-stats">
+                <div className="stat-card">
+                  <div className="stat-num">{acceptedCount}</div>
+                  <div className="stat-lbl">Accepted</div>
+                </div>
+                <div className="stat-card">
+                  <div className="stat-num">{rejectedCount}</div>
+                  <div className="stat-lbl">Rejected</div>
+                </div>
+                <div className="stat-card">
+                  <div className="stat-num">{Math.round(overallHealth * 100)}%</div>
+                  <div className="stat-lbl">Health Score</div>
+                </div>
+              </div>
+              <button className="btn-outline btn-full" onClick={() => {
+                setStatus('idle'); setJobId(''); setInferenceStatus('idle')
+                setEmbeddingStatus('idle'); setColumnStates({}); setFile(null)
+              }}>
+                ➕ Process Another File
+              </button>
+            </section>
+          )}
 
-      <section className="panel">
-        <div className="grid">
-          <div>
-            <div className="label">Job ID</div>
-            <div className="value">{jobId || '—'}</div>
-          </div>
-          <div>
-            <div className="label">Job Status</div>
-            <div className={`value badge badge-${status}`}>{status}</div>
-          </div>
-          <div>
-            <div className="label">Task Status</div>
-            <div className={`value badge badge-${taskStatus || 'none'}`}>
-              {taskStatus || '—'}
-            </div>
-          </div>
-          <div>
-            <div className="label">Step</div>
-            <div className="value">{step || '—'}</div>
-          </div>
-        </div>
-      </section>
+          {/* ── Job Status Row (always visible when job active) ── */}
+          {jobId && (
+            <section className="panel panel-status">
+              <div className="status-grid">
+                <div>
+                  <div className="label">Job ID</div>
+                  <div className="job-id-val">{jobId.slice(0, 12)}…</div>
+                </div>
+                <div>
+                  <div className="label">Status</div>
+                  <div className={`badge badge-${status}`}>{status}</div>
+                </div>
+                <div>
+                  <div className="label">Task</div>
+                  <div className={`badge badge-${taskStatus || 'none'}`}>{taskStatus || '—'}</div>
+                </div>
+                <div>
+                  <div className="label">Step</div>
+                  <div className="step-val">{step || '—'}</div>
+                </div>
+              </div>
+            </section>
+          )}
 
-      <section className="panel">
-        <div className="panel-header">
-          <div className="label">Result</div>
-          <button
-            className="toggle"
-            onClick={() => setResultExpanded((prev) => !prev)}
-            disabled={!result}
-          >
-            {resultExpanded ? '−' : '+'}
-          </button>
-        </div>
-        {resultExpanded ? (
-          result ? (
-            <JsonTree data={result as JsonValue} />
-          ) : (
-            <pre>—</pre>
-          )
-        ) : (
-          <pre>{result ? '{...}' : '—'}</pre>
-        )}
-        {result && (result as { preview?: unknown }).preview && (
-          <>
+          {/* ── Raw Result (collapsible) ── */}
+          {result && (
+            <section className="panel panel-raw">
+              <div className="panel-header">
+                <div className="label">Raw Result</div>
+                <button className="btn-ghost btn-sm" onClick={() => setShowRawResult(v => !v)}>
+                  {showRawResult ? '− Collapse' : '+ Expand'}
+                </button>
+              </div>
+              {showRawResult && <JsonTree data={result as JsonValue} />}
+            </section>
+          )}
+
+          {/* ── Event Log (collapsible) ── */}
+          <section className="panel panel-log">
             <div className="panel-header">
-              <div className="label">Preview</div>
-              <button
-                className="toggle"
-                onClick={() => setPreviewExpanded((prev) => !prev)}
-              >
-                {previewExpanded ? '−' : '+'}
+              <div className="label">Event Log</div>
+              <button className="btn-ghost btn-sm" onClick={() => setShowEventLog(v => !v)}>
+                {showEventLog ? '− Hide' : '+ Show'}
               </button>
             </div>
-            {previewExpanded ? (
-              <JsonTree data={(result as { preview?: JsonValue }).preview as JsonValue} />
-            ) : (
-              <pre>{'{...}'}</pre>
+            {showEventLog && (
+              <ul className="event-log">
+                {events.length === 0 && <li>No events yet.</li>}
+                {events.map((e, i) => <li key={`${e}-${i}`}>{e}</li>)}
+              </ul>
             )}
-          </>
-        )}
-        {error && (
-          <>
-            <div className="label">Error</div>
-            <pre className="error">{error}</pre>
-          </>
-        )}
-      </section>
+          </section>
 
-      <section className="panel">
-        <div className="panel-header">
-          <div className="label">
-            Schema Inference
-            {selectedSchema && <span className="badge badge-selected">Selected</span>}
-          </div>
-          <button
-            className="toggle"
-            onClick={() => setAnalysisExpanded((prev) => !prev)}
-            disabled={!analysis}
-          >
-            {analysisExpanded ? '−' : '+'}
-          </button>
         </div>
-        {analysisExpanded ? (
-          schemaInference ? (
-            <JsonTree data={schemaInference as JsonValue} />
-          ) : (
-            <pre>—</pre>
-          )
-        ) : (
-          <pre>{schemaInference ? '{...}' : '—'}</pre>
-        )}
-        {selectedSchema && (
-          <>
-            <div className="panel-header">
-              <div className="label">Selected Schema</div>
-            </div>
-            <JsonTree data={selectedSchema as JsonValue} />
-          </>
-        )}
-        {inferenceError && (
-          <>
-            <div className="label">Inference Error</div>
-            <pre className="error">{inferenceError}</pre>
-          </>
-        )}
-        {embeddingError && (
-          <>
-            <div className="label">Embedding Error</div>
-            <pre className="error">{embeddingError}</pre>
-          </>
-        )}
-      </section>
-
-      <section className="panel">
-        <div className="label">Event Log</div>
-        <ul>
-          {events.map((entry, index) => (
-            <li key={`${entry}-${index}`}>{entry}</li>
-          ))}
-        </ul>
-      </section>
+      </div>
     </div>
   )
 }
