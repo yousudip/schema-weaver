@@ -27,7 +27,12 @@ class SessionManager:
         self._root.mkdir(parents=True, exist_ok=True)
         self._audit_dir = settings.local_storage_dir / "audit"
         self._analyzer = StaticCodeAnalyzer(
-            safe_imports={"pandas", "numpy", "math", "datetime", "json", "re"}
+            # pandas/numpy for data work; os/sys/pathlib needed by the preamble;
+            # signal needed by the timeout wrapper; io/csv for output writing.
+            safe_imports={
+                "pandas", "numpy", "math", "datetime", "json", "re",
+                "pathlib", "os", "sys", "signal", "io", "csv",
+            }
         )
 
     def create_session(self) -> SessionInfo:

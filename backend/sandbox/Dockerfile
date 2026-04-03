@@ -10,7 +10,7 @@ WORKDIR /sandbox
 RUN apt-get update \
     && apt-get install -y --no-install-recommends tesseract-ocr poppler-utils \
     && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir pandas numpy
+RUN pip install --no-cache-dir pandas numpy openpyxl xlrd
 
 USER sandbox
 

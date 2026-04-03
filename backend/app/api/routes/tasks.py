@@ -372,14 +372,14 @@ async def execute_code(request: Request, job_id: str, body: ExecuteRequest | Non
                 input_filename = "input_file" + original_ext
                 session_mgr.upload_file(sandbox_session, input_filename, fh.read())
 
-            # Wrap with preamble that sets input_path / output_path / file_type
-            wrapped = wrap_for_sandbox(user_code)
-            # Override env vars via preamble constants
-            wrapped = (
-                f'import os\nos.environ["INPUT_PATH"]  = "/sandbox/data/{input_filename}"\n'
+            # Inject env vars before the preamble so SANDBOX_PREAMBLE picks them up
+            env_block = (
+                f'import os\n'
+                f'os.environ["INPUT_PATH"]  = "/sandbox/data/{input_filename}"\n'
                 f'os.environ["OUTPUT_PATH"] = "/sandbox/data/output.csv"\n'
-                f'os.environ["FILE_TYPE"]   = "{file_type}"\n'
-            ) + wrapped
+                f'os.environ["FILE_TYPE"]   = "{file_type}"\n\n'
+            )
+            wrapped = env_block + wrap_for_sandbox(user_code)
 
             sandbox_log = session_mgr.execute_code(sandbox_session, wrapped, timeout_seconds=120)
 
@@ -412,11 +412,7 @@ async def execute_code(request: Request, job_id: str, body: ExecuteRequest | Non
                 with open(storage_path, "rb") as fh:
                     session_mgr.upload_file(sandbox_session, input_filename, fh.read())
 
-                wrapped_fix = (
-                    f'import os\nos.environ["INPUT_PATH"]  = "/sandbox/data/{input_filename}"\n'
-                    f'os.environ["OUTPUT_PATH"] = "/sandbox/data/output.csv"\n'
-                    f'os.environ["FILE_TYPE"]   = "{file_type}"\n'
-                ) + wrap_for_sandbox(fixed_code)
+                wrapped_fix = env_block + wrap_for_sandbox(fixed_code)
 
                 sandbox_log += "\n\n--- SELF-HEAL RETRY ---\n"
                 sandbox_log += session_mgr.execute_code(sandbox_session, wrapped_fix, timeout_seconds=120)

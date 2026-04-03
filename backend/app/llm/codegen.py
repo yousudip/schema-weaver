@@ -64,8 +64,8 @@ file_type    # str — one of "csv", "excel", "pdf"
 2. **Select & rename** — keep ONLY the source columns listed above and rename
    them to their target names. Use `df.rename(columns={{...}})`.
 3. **Clean each column by inferred type**:
-   - `date` → `pd.to_datetime(col, infer_datetime_format=True, errors='coerce')`
-     then `.dt.strftime('%Y-%m-%d')`.
+   - `date` → `pd.to_datetime(col, errors='coerce')` (pandas 2.x — do NOT use
+     `infer_datetime_format` which was removed) then `.dt.strftime('%Y-%m-%d')`.
    - `currency` / `number` → strip `$£€,` and whitespace, coerce to float with
      `pd.to_numeric(col.str.replace(r'[^\\d.\\-]','',regex=True), errors='coerce')`.
    - `string` → `.str.strip()`.  For status-like columns (≤10 unique values)

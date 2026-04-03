@@ -255,12 +255,33 @@ function App() {
     const res = await fetch(`${apiBase}/api/v1/jobs/${jobId}`)
     if (!res.ok) return
     const data = await res.json()
-    setStatus(data?.job?.status || 'unknown')
-    setTaskStatus(data?.job?.task_status || null)
-    setStep(data?.job?.step || null)
-    setResult(data?.job?.result || null)
-    setAnalysis(data?.job?.analysis || null)
-    setError(data?.job?.error || null)
+    const job = data?.job
+    if (!job) return
+    setStatus(job.status || 'unknown')
+    setTaskStatus(job.task_status || null)
+    setStep(job.step || null)
+    setResult(job.result || null)
+    setAnalysis(job.analysis || null)
+    setError(job.error || null)
+
+    // Restore derived statuses from persisted analysis so loaded jobs
+    // resume at the correct wizard step without re-running each stage
+    const analysis = job.analysis || {}
+    if (analysis.schema_inference || analysis.selected_schema) {
+      setInferenceStatus('ok')
+    }
+    if (analysis.generated_code) {
+      setGeneratedCode(analysis.generated_code)
+      setGenerateStatus('ok')
+      setCodeEdited(false)
+    }
+    if (analysis.cleaned_preview) {
+      setCleanedPreview(analysis.cleaned_preview)
+      setExecuteStatus('ok')
+    }
+    if (analysis.execution_log) {
+      setSandboxLog(analysis.execution_log)
+    }
   }
 
   async function handleUpload() {
@@ -376,12 +397,31 @@ function App() {
     setGeneratedCode(''); setSandboxLog(''); setCleanedPreview(null); setCodeEdited(false)
   }
 
-  function handleSelectJob(id: string) {
-    setJobId(id); setAnalysis(null)
+  async function handleSelectJob(id: string) {
+    // Reset all derived state first
+    setJobId(id)
+    setAnalysis(null)
     setInferenceStatus('idle'); setEmbeddingStatus('idle')
     setMappings([]); setColumnStates({})
     resetAll()
-    setTimeout(handleRefresh, 50)
+    // Then load job data and restore statuses from persisted analysis
+    const res = await fetch(`${apiBase}/api/v1/jobs/${id}`)
+    if (!res.ok) return
+    const data = await res.json()
+    const job = data?.job
+    if (!job) return
+    setStatus(job.status || 'unknown')
+    setTaskStatus(job.task_status || null)
+    setStep(job.step || null)
+    setResult(job.result || null)
+    setAnalysis(job.analysis || null)
+    setError(job.error || null)
+
+    const a = job.analysis || {}
+    if (a.schema_inference || a.selected_schema) setInferenceStatus('ok')
+    if (a.generated_code) { setGeneratedCode(a.generated_code); setGenerateStatus('ok'); setCodeEdited(false) }
+    if (a.cleaned_preview) { setCleanedPreview(a.cleaned_preview); setExecuteStatus('ok') }
+    if (a.execution_log) setSandboxLog(a.execution_log)
   }
 
   async function handleDeleteJob(id: string) {
