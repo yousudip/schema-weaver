@@ -128,8 +128,29 @@ async def startup() -> None:
     app.state.settings = settings
     engine = create_db_engine(settings)
     with engine.begin() as connection:
-        connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-    Base.metadata.create_all(engine)
+        try:
+            connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            logging.getLogger(__name__).info("pgvector extension enabled.")
+        except Exception as vec_err:
+            logging.getLogger(__name__).warning(
+                "pgvector extension not available — semantic schema matching will be disabled. "
+                "Install pgvector for PostgreSQL 17 to enable it. Error: %s", vec_err
+            )
+    # Create tables individually so a missing pgvector extension
+    # doesn't block the jobs/tasks tables from being created.
+    from backend.app.db_models import Job, Task as TaskModel, SchemaVector
+    for table in [Job.__table__, TaskModel.__table__]:
+        try:
+            table.create(engine, checkfirst=True)
+        except Exception as tbl_err:
+            logging.getLogger(__name__).error("Failed to create table %s: %s", table.name, tbl_err)
+    try:
+        SchemaVector.__table__.create(engine, checkfirst=True)
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "schema_vectors table could not be created (pgvector missing) — "
+            "embedding features disabled."
+        )
     check_db_connection(engine)
     app.state.db_engine = engine
     app.state.db_session_factory = create_session_factory(engine)
