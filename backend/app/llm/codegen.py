@@ -90,6 +90,117 @@ No prose, no explanations outside the code block.
 """
 
 
+def build_validation_prompt(
+    schema: dict,
+    quality_report: dict,
+    original_code: str,
+    raw_sample_rows: list,
+) -> str:
+    """
+    Ask the LLM to judge whether the cleaned output meets quality standards.
+    If not, it must return a fixed script.
+
+    The LLM must respond with a single JSON object:
+      { "verdict": "pass" }
+      or
+      { "verdict": "fail", "issues": ["..."], "fixed_code": "..." }
+    """
+    import json as _json
+    col_issues = [
+        f"  - {c['name']} ({c['type']}): fill_rate={c['fill_rate']*100:.0f}%"
+        f"  sample={c['sample_values'][:3]}  issues={c['issues']}"
+        for c in quality_report.get("columns", [])
+        if c.get("issues") or c["fill_rate"] < 1.0
+    ]
+    col_issues_text = "\n".join(col_issues) if col_issues else "  (no column issues detected)"
+
+    columns_spec = schema.get("columns", [])
+    col_table = "\n".join(
+        f"  {c.get('suggested_name','?')} | {c.get('inferred_type','string')} | {c.get('description','')}"
+        for c in columns_spec
+    )
+
+    raw_sample_json = _json.dumps(raw_sample_rows[:4], indent=2, default=str)
+
+    return f"""You are a senior data-quality engineer reviewing the output of an automated
+pandas data-cleaning script.
+
+## Expected output schema
+{col_table}
+
+## Quality report (after running the script)
+- Total rows: {quality_report.get('total_rows', '?')}
+- Overall fill rate: {quality_report.get('overall_fill_rate', 0)*100:.1f}%
+- Pass: {quality_report.get('pass', False)}
+
+Column details (only columns with fill < 100% or issues shown):
+{col_issues_text}
+
+## Raw sample rows (first 4, before cleaning)
+```json
+{raw_sample_json}
+```
+
+## Current cleaning script
+```python
+{original_code[:4000]}
+```
+
+## Your task
+1. Inspect the quality report carefully.
+2. If ALL date columns have ≥ 80% ISO-format fill rate AND all numeric columns are
+   ≥ 90% numeric, respond with {{"verdict": "pass"}}.
+3. Otherwise identify the root cause for each failing column and rewrite the
+   complete fixed script.
+
+## Critical date-parsing rules (apply when dates are failing):
+- Excel `.xlsx` files often store dates as **5-digit integer serial numbers**
+  (e.g. 45657). When read with `dtype=str` these come through as "45657".
+  To convert: `pd.to_datetime('1899-12-30') + pd.to_timedelta(pd.to_numeric(col, errors='coerce'), unit='D')`
+- For mixed-format string dates (DD/MM/YYYY, MM-DD-YY, etc.) try:
+  `pd.to_datetime(col, dayfirst=True, errors='coerce')`
+  then fall back to: `pd.to_datetime(col, format='mixed', dayfirst=True, errors='coerce')`
+- NEVER use `infer_datetime_format=True` (removed in pandas 2.x).
+- For a column that has BOTH serial integers AND string dates, detect and branch:
+  ```python
+  def parse_mixed_dates(s):
+      numeric = pd.to_numeric(s, errors='coerce')
+      result = pd.Series(index=s.index, dtype='object')
+      is_serial = numeric.notna() & (numeric > 40000) & (numeric < 60000)
+      result[is_serial] = (
+          pd.Timestamp('1899-12-30') + pd.to_timedelta(numeric[is_serial], unit='D')
+      )
+      result[~is_serial] = pd.to_datetime(s[~is_serial], errors='coerce')
+      return pd.to_datetime(result, errors='coerce')
+  ```
+
+## Response format
+Respond with ONLY a JSON object — no markdown, no prose:
+{{"verdict": "pass"}}
+or
+{{"verdict": "fail", "issues": ["issue 1", "issue 2"], "fixed_code": "...full python script..."}}
+
+The fixed_code must be a complete, standalone script (same structure as the original).
+"""
+
+
+def parse_validation_response(text: str) -> dict:
+    """Extract the JSON verdict from the LLM validation response."""
+    import json as _json
+    # Strip markdown code fences if present
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    # Find first { ... } block
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if m:
+        try:
+            return _json.loads(m.group(0))
+        except _json.JSONDecodeError:
+            pass
+    return {"verdict": "pass"}   # safe fallback — don't block on parse error
+
+
 def build_codegen_reflexion_prompt(
     original_code: str,
     error_output: str,

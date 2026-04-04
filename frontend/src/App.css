@@ -1161,3 +1161,215 @@ details[open] .sandbox-log-title::before { content: '▼ '; }
   border-top: 1px solid var(--gray-100);
   background: white;
 }
+
+
+/* ------------------------------------------------------
+   Quality Report  (Task 5.2)
+   ------------------------------------------------------ */
+
+.quality-report {
+  margin-top: 1.5rem;
+  border: 1px solid #e8e0ff;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #fafafa;
+}
+
+.quality-report-error {
+  padding: 1rem;
+  color: #dc2626;
+  background: #fee2e2;
+}
+
+/* Header */
+.quality-header {
+  padding: 1rem 1.25rem 0.75rem;
+  background: linear-gradient(135deg, #1e1044 0%, #2d1d6e 100%);
+  color: #fff;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.quality-title {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.quality-icon { font-size: 1.2rem; }
+
+.quality-badge {
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 999px;
+  letter-spacing: 0.06em;
+}
+.quality-badge-pass { background: #16a34a; color: #fff; }
+.quality-badge-fail { background: #dc2626; color: #fff; }
+
+/* Summary pills row */
+.quality-summary-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.qpill {
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.12);
+  color: #e9d5ff;
+}
+.qpill-pass { background: #166534; color: #bbf7d0; }
+.qpill-warn { background: #78350f; color: #fde68a; }
+.qpill-fail { background: #7f1d1d; color: #fca5a5; }
+
+/* Validation attempt trail */
+.quality-attempts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.73rem;
+  padding-bottom: 0.25rem;
+}
+.quality-attempts-label {
+  color: #a78bfa;
+  font-weight: 600;
+  margin-right: 0.25rem;
+}
+.attempt-badge {
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: rgba(255,255,255,0.1);
+  color: #ddd6fe;
+  white-space: nowrap;
+}
+.attempt-badge[data-verdict=pass] { background: #14532d; color: #86efac; }
+.attempt-badge[data-verdict=crash] { background: #7f1d1d; color: #fca5a5; }
+
+/* Table */
+.quality-table-wrap {
+  overflow-x: auto;
+}
+.quality-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+.quality-table thead tr {
+  background: #f0ebff;
+  color: #4c1d95;
+}
+.quality-table th {
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  font-weight: 600;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-bottom: 2px solid #ddd6fe;
+  white-space: nowrap;
+}
+.quality-table td {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid #f0ebff;
+  vertical-align: middle;
+}
+.quality-row-ok { background: #fff; }
+.quality-row-ok:hover { background: #faf5ff; }
+.quality-row-warn { background: #fffbeb; }
+.quality-row-warn:hover { background: #fef3c7; }
+
+/* Column name cell */
+.quality-col-name {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-weight: 600;
+  color: #1e1044;
+  white-space: nowrap;
+}
+.quality-col-icon { font-size: 0.9rem; }
+.quality-col-source {
+  font-size: 0.7rem;
+  color: #9ca3af;
+  font-weight: 400;
+}
+
+/* Type badge */
+.quality-type-badge {
+  font-size: 0.7rem;
+  background: #ede9fe;
+  color: #5b21b6;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-weight: 600;
+}
+
+/* Fill rate bar */
+.quality-fill-bar-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 120px;
+}
+.quality-fill-bar {
+  height: 8px;
+  border-radius: 4px;
+  flex-shrink: 0;
+  transition: width 0.4s ease;
+}
+.quality-fill-pct {
+  font-size: 0.78rem;
+  font-weight: 700;
+  min-width: 36px;
+}
+
+/* Counts */
+.quality-counts {
+  color: #6b7280;
+  white-space: nowrap;
+}
+.quality-missing {
+  color: #dc2626;
+  font-weight: 700;
+  font-size: 0.75rem;
+}
+
+/* Sample values */
+.quality-samples { max-width: 200px; }
+.quality-sample-val {
+  display: inline-block;
+  background: #f3f4f6;
+  color: #374151;
+  font-size: 0.72rem;
+  padding: 1px 5px;
+  border-radius: 4px;
+  margin: 1px;
+  max-width: 80px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.quality-empty-note { color: #d1d5db; font-style: italic; }
+
+/* Issues */
+.quality-issues { max-width: 280px; }
+.quality-issue-item {
+  color: #b45309;
+  font-size: 0.72rem;
+  line-height: 1.4;
+  margin-bottom: 2px;
+}
+.quality-ok-note {
+  color: #16a34a;
+  font-size: 0.78rem;
+  font-weight: 600;
+}

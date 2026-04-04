@@ -3,6 +3,8 @@ import type { ReactElement } from 'react'
 import './App.css'
 import { SchemaMapper } from './SchemaMapper'
 import type { MappingEntry } from './SchemaMapper'
+import { QualityReport } from './QualityReport'
+import type { QualityReportData, ValidationAttempt } from './QualityReport'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -157,6 +159,8 @@ function App() {
   const [generatedCode, setGeneratedCode] = useState<string>('')
   const [sandboxLog, setSandboxLog] = useState<string>('')
   const [cleanedPreview, setCleanedPreview] = useState<CleanedPreview | null>(null)
+  const [qualityReport, setQualityReport] = useState<QualityReportData | null>(null)
+  const [validationAttempts, setValidationAttempts] = useState<ValidationAttempt[]>([])
   const [codeEdited, setCodeEdited] = useState(false)
   const [showEventLog, setShowEventLog] = useState(false)
   const [showRawResult, setShowRawResult] = useState(false)
@@ -282,6 +286,8 @@ function App() {
     if (analysis.execution_log) {
       setSandboxLog(analysis.execution_log)
     }
+    if (analysis.quality_report) setQualityReport(analysis.quality_report)
+    if (analysis.validation_attempts) setValidationAttempts(analysis.validation_attempts)
   }
 
   async function handleUpload() {
@@ -369,6 +375,8 @@ function App() {
     setExecuteStatus('running')
     setSandboxLog('')
     setCleanedPreview(null)
+    setQualityReport(null)
+    setValidationAttempts([])
     addToast('info', 'Running script in Docker sandbox...')
     try {
       const body = codeEdited ? JSON.stringify({ code: generatedCode }) : '{}'
@@ -381,6 +389,8 @@ function App() {
       const data = await res.json()
       setSandboxLog(data.sandbox_log || '')
       setAnalysis(data.analysis || analysis)
+      if (data.quality_report) setQualityReport(data.quality_report)
+      if (data.validation_attempts) setValidationAttempts(data.validation_attempts)
       if (data.status !== 'ok' || !data.cleaned_preview) {
         setExecuteStatus('error')
         addToast('error', 'Sandbox execution failed — check log for details.')
@@ -388,13 +398,17 @@ function App() {
       }
       setCleanedPreview(data.cleaned_preview)
       setExecuteStatus('ok')
-      addToast('success', `✅ ${data.cleaned_preview.row_count} rows cleaned successfully!`)
+      const qr = data.quality_report
+      const fillPct = qr ? Math.round(qr.overall_fill_rate * 100) : 100
+      const passed = qr?.pass !== false
+      addToast('success', `✅ ${data.cleaned_preview.row_count} rows cleaned · ${fillPct}% fill rate${passed ? '' : ' ⚠ quality issues found'}`)
     } catch { setExecuteStatus('error'); addToast('error', 'Network error during execution.') }
   }
 
   function resetAll() {
     setGenerateStatus('idle'); setExecuteStatus('idle')
     setGeneratedCode(''); setSandboxLog(''); setCleanedPreview(null); setCodeEdited(false)
+    setQualityReport(null); setValidationAttempts([])
   }
 
   async function handleSelectJob(id: string) {
@@ -422,6 +436,8 @@ function App() {
     if (a.generated_code) { setGeneratedCode(a.generated_code); setGenerateStatus('ok'); setCodeEdited(false) }
     if (a.cleaned_preview) { setCleanedPreview(a.cleaned_preview); setExecuteStatus('ok') }
     if (a.execution_log) setSandboxLog(a.execution_log)
+    if (a.quality_report) setQualityReport(a.quality_report)
+    if (a.validation_attempts) setValidationAttempts(a.validation_attempts)
   }
 
   async function handleDeleteJob(id: string) {
@@ -835,6 +851,14 @@ function App() {
                 </details>
               )}
 
+              {/* Quality Report */}
+              {qualityReport && (
+                <QualityReport
+                  report={qualityReport}
+                  attempts={validationAttempts}
+                />
+              )}
+
               {/* Cleaned data preview */}
               {cleanedPreview && (
                 <div className="cleaned-preview">
@@ -894,8 +918,16 @@ function App() {
                   <div className="stat-lbl">Columns</div>
                 </div>
                 <div className="stat-card">
+                  <div className="stat-num">
+                    {qualityReport
+                      ? `${Math.round(qualityReport.overall_fill_rate * 100)}%`
+                      : `${Math.round(overallHealth * 100)}%`}
+                  </div>
+                  <div className="stat-lbl">Fill Rate</div>
+                </div>
+                <div className="stat-card">
                   <div className="stat-num">{Math.round(overallHealth * 100)}%</div>
-                  <div className="stat-lbl">Health Score</div>
+                  <div className="stat-lbl">Schema Health</div>
                 </div>
               </div>
               <a
@@ -912,6 +944,16 @@ function App() {
               }}>
                 ➕ Process Another File
               </button>
+
+              {/* Quality report in export panel */}
+              {qualityReport && (
+                <div style={{ marginTop: '1.5rem' }}>
+                  <QualityReport
+                    report={qualityReport}
+                    attempts={validationAttempts}
+                  />
+                </div>
+              )}
             </section>
           )}
 

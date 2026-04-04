@@ -26,9 +26,12 @@ from backend.app.llm.embeddings import build_rich_representation, embed_texts
 from backend.app.llm.codegen import (
     build_codegen_prompt,
     build_codegen_reflexion_prompt,
+    build_validation_prompt,
     parse_generated_code,
+    parse_validation_response,
     wrap_for_sandbox,
 )
+from backend.app.llm.quality import compute_quality_report
 
 router = APIRouter()
 
@@ -335,14 +338,19 @@ class ExecuteRequest(BaseModel):
 
 @router.post("/api/v1/jobs/{job_id}/execute")
 async def execute_code(request: Request, job_id: str, body: ExecuteRequest | None = None) -> Dict[str, Any]:
-    """Run the (optionally user-edited) cleaning script in the Docker sandbox."""
+    """
+    Run the cleaning script in the Docker sandbox, then validate quality.
+    Automatically retries up to MAX_VALIDATION_ATTEMPTS times if the LLM
+    flags critical quality issues (e.g. all dates are empty).
+    """
+    MAX_VALIDATION_ATTEMPTS = 3
+
     session = get_db_session(request.app.state.db_session_factory)
     try:
         job = session.execute(select(Job).where(Job.id == job_id)).scalar_one_or_none()
         if not job:
             return {"status": "error", "message": "Job not found."}
 
-        # Resolve which code to run
         user_code = (body.code if body and body.code else None) or (
             job.analysis or {}
         ).get("generated_code")
@@ -357,102 +365,164 @@ async def execute_code(request: Request, job_id: str, body: ExecuteRequest | Non
         if not storage_path or not Path(storage_path).exists():
             return {"status": "error", "message": "Source file not found on disk."}
 
+        schema = (job.analysis or {}).get("selected_schema") or (job.analysis or {}).get("schema_inference") or {}
+        raw_sample_rows = (job.result or {}).get("preview", {}).get("sample_rows", [])
         file_type = (job.result or {}).get("file_type", "csv")
         original_ext = Path(storage_path).suffix.lower() or ".csv"
+        input_filename = "input_file" + original_ext
 
-        # Create sandbox session
+        client = request.app.state.llm_client
+        model = request.app.state.settings.azure_openai_deployment_gpt5_mini
+
         sandbox_session = session_mgr.create_session()
-        sandbox_log = ""
-        cleaned_preview = None
         output_path_host = Path(sandbox_session.workspace_dir) / "output.csv"
 
+        # Pre-build the env injection block (reused across all attempts)
+        env_block = (
+            f'import os\n'
+            f'os.environ["INPUT_PATH"]  = "/sandbox/data/{input_filename}"\n'
+            f'os.environ["OUTPUT_PATH"] = "/sandbox/data/output.csv"\n'
+            f'os.environ["FILE_TYPE"]   = "{file_type}"\n\n'
+        )
+
+        sandbox_log = ""
+        cleaned_preview = None
+        quality_report = None
+        validation_attempts: list[dict] = []
+        current_code = user_code
+
         try:
-            # Upload source file into sandbox workspace
+            # ── Upload source file once ──────────────────────────────────────
             with open(storage_path, "rb") as fh:
-                input_filename = "input_file" + original_ext
                 session_mgr.upload_file(sandbox_session, input_filename, fh.read())
 
-            # Inject env vars before the preamble so SANDBOX_PREAMBLE picks them up
-            env_block = (
-                f'import os\n'
-                f'os.environ["INPUT_PATH"]  = "/sandbox/data/{input_filename}"\n'
-                f'os.environ["OUTPUT_PATH"] = "/sandbox/data/output.csv"\n'
-                f'os.environ["FILE_TYPE"]   = "{file_type}"\n\n'
-            )
-            wrapped = env_block + wrap_for_sandbox(user_code)
+            for attempt in range(MAX_VALIDATION_ATTEMPTS):
+                attempt_log = f"\n{'='*60}\n--- ATTEMPT {attempt + 1}/{MAX_VALIDATION_ATTEMPTS} ---\n"
 
-            sandbox_log = session_mgr.execute_code(sandbox_session, wrapped, timeout_seconds=120)
+                # ── Step 1: Run the script ────────────────────────────────────
+                run_ok = False
+                try:
+                    wrapped = env_block + wrap_for_sandbox(current_code)
+                    run_output = session_mgr.execute_code(sandbox_session, wrapped, timeout_seconds=120)
+                    attempt_log += run_output
+                    run_ok = True
+                except Exception as run_err:
+                    attempt_log += f"EXECUTION ERROR: {run_err}"
+                    # Self-heal crash with reflexion prompt
+                    try:
+                        fix_prompt = build_codegen_reflexion_prompt(current_code, str(run_err))
+                        fix_resp = client.responses.create(model=model, input=fix_prompt)
+                        current_code = parse_generated_code(fix_resp.output_text)
+                        attempt_log += "\n[reflexion fix applied — retrying next attempt]"
+                        # Re-upload source file before next attempt
+                        with open(storage_path, "rb") as fh:
+                            session_mgr.upload_file(sandbox_session, input_filename, fh.read())
+                    except Exception as heal_err:
+                        attempt_log += f"\n[reflexion failed: {heal_err}]"
+                    sandbox_log += attempt_log
+                    validation_attempts.append({"attempt": attempt + 1, "run_ok": False, "verdict": "crash"})
+                    continue
 
-            # Read back the output CSV if it exists
-            if output_path_host.exists():
+                sandbox_log += attempt_log
+
+                if not run_ok or not output_path_host.exists():
+                    validation_attempts.append({"attempt": attempt + 1, "run_ok": False, "verdict": "no_output"})
+                    continue
+
+                # ── Step 2: Build cleaned preview ─────────────────────────────
                 with open(output_path_host, "r", encoding="utf-8-sig", errors="replace") as f:
                     reader = csv.DictReader(f)
-                    rows = []
-                    for i, row in enumerate(reader):
-                        if i >= 100:
-                            break
-                        rows.append(dict(row))
+                    rows = [dict(r) for i, r in enumerate(reader) if i < 100]
                 cleaned_preview = {
                     "columns": list(rows[0].keys()) if rows else [],
                     "sample_rows": rows[:20],
                     "row_count": sum(1 for _ in open(output_path_host, encoding="utf-8-sig")) - 1,
                 }
-        except Exception as exec_err:
-            sandbox_log = str(exec_err)
 
-            # Self-healing: one reflexion retry
-            try:
-                client = request.app.state.llm_client
-                model = request.app.state.settings.azure_openai_deployment_gpt5_mini
-                fix_prompt = build_codegen_reflexion_prompt(user_code, sandbox_log)
-                fix_response = client.responses.create(model=model, input=fix_prompt)
-                fixed_code = parse_generated_code(fix_response.output_text)
+                # ── Step 3: Compute quality report ────────────────────────────
+                quality_report = compute_quality_report(output_path_host, schema)
+                sandbox_log += (
+                    f"\n[quality] overall_fill={quality_report['overall_fill_rate']*100:.1f}%"
+                    f"  pass={quality_report['pass']}"
+                    f"  rows={quality_report['total_rows']}\n"
+                )
+                for cr in quality_report.get("columns", []):
+                    if cr.get("issues"):
+                        sandbox_log += f"  ⚠ {cr['name']}: {'; '.join(cr['issues'])}\n"
 
-                # Upload fresh copy of file for retry
-                with open(storage_path, "rb") as fh:
-                    session_mgr.upload_file(sandbox_session, input_filename, fh.read())
+                validation_attempts.append({
+                    "attempt": attempt + 1,
+                    "run_ok": True,
+                    "verdict": "pass" if quality_report["pass"] else "pending",
+                    "fill_rate": quality_report["overall_fill_rate"],
+                })
 
-                wrapped_fix = env_block + wrap_for_sandbox(fixed_code)
+                # ── Step 4: LLM judges quality ────────────────────────────────
+                if quality_report["pass"]:
+                    sandbox_log += "\n[validation] ✅ Quality check PASSED\n"
+                    break
 
-                sandbox_log += "\n\n--- SELF-HEAL RETRY ---\n"
-                sandbox_log += session_mgr.execute_code(sandbox_session, wrapped_fix, timeout_seconds=120)
+                if attempt >= MAX_VALIDATION_ATTEMPTS - 1:
+                    sandbox_log += "\n[validation] ⚠ Max attempts reached — keeping best output\n"
+                    break
 
-                if output_path_host.exists():
-                    with open(output_path_host, "r", encoding="utf-8-sig", errors="replace") as f:
-                        reader = csv.DictReader(f)
-                        rows = []
-                        for i, row in enumerate(reader):
-                            if i >= 100:
-                                break
-                            rows.append(dict(row))
-                    cleaned_preview = {
-                        "columns": list(rows[0].keys()) if rows else [],
-                        "sample_rows": rows[:20],
-                        "row_count": sum(1 for _ in open(output_path_host, encoding="utf-8-sig")) - 1,
-                    }
+                sandbox_log += "\n[validation] ❌ Quality issues found — asking LLM to fix...\n"
+                try:
+                    val_prompt = build_validation_prompt(
+                        schema, quality_report, current_code, raw_sample_rows
+                    )
+                    val_resp = client.responses.create(model=model, input=val_prompt)
+                    verdict = parse_validation_response(val_resp.output_text)
+                    sandbox_log += f"[validation verdict] {verdict.get('verdict','?')}\n"
 
-                # Save the fixed code back into analysis
-                analysis = dict(job.analysis or {})
-                analysis["generated_code"] = fixed_code
-                analysis["self_healed"] = True
-                job.analysis = analysis
-            except Exception as heal_err:
-                sandbox_log += f"\n--- SELF-HEAL FAILED: {heal_err} ---"
+                    if verdict.get("verdict") == "pass":
+                        sandbox_log += "[validation] LLM says quality is acceptable\n"
+                        break
+
+                    issues_reported = verdict.get("issues", [])
+                    for iss in issues_reported:
+                        sandbox_log += f"  LLM issue: {iss}\n"
+
+                    fixed_code = verdict.get("fixed_code", "")
+                    if fixed_code:
+                        current_code = parse_generated_code(fixed_code) if "```" in fixed_code else fixed_code
+                        sandbox_log += "[validation] LLM rewrote the script — retrying...\n"
+                        # Re-upload source file for next attempt
+                        with open(storage_path, "rb") as fh:
+                            session_mgr.upload_file(sandbox_session, input_filename, fh.read())
+                        # Delete old output so we don't accidentally read stale data
+                        if output_path_host.exists():
+                            output_path_host.unlink()
+                    else:
+                        sandbox_log += "[validation] LLM gave no fixed_code — stopping\n"
+                        break
+
+                except Exception as val_err:
+                    sandbox_log += f"[validation error] {val_err} — keeping current output\n"
+                    break
+
         finally:
             session_mgr.close_session(sandbox_session)
 
-        # Persist execution result
+        # ── Persist everything ────────────────────────────────────────────────
         analysis = dict(job.analysis or {})
-        analysis["execution_log"] = sandbox_log[-4000:]        # keep last 4k chars
+        analysis["execution_log"] = sandbox_log[-6000:]
         analysis["cleaned_preview"] = cleaned_preview
+        analysis["quality_report"] = quality_report
         analysis["execution_ok"] = cleaned_preview is not None
+        analysis["validation_attempts"] = validation_attempts
+        if current_code != user_code:
+            analysis["generated_code"] = current_code
+            analysis["self_healed"] = True
         job.analysis = analysis
         session.commit()
 
         return {
             "status": "ok" if cleaned_preview else "error",
-            "sandbox_log": sandbox_log[-2000:],
+            "sandbox_log": sandbox_log[-3000:],
             "cleaned_preview": cleaned_preview,
+            "quality_report": quality_report,
+            "validation_attempts": validation_attempts,
             "analysis": job.analysis,
         }
     finally:
