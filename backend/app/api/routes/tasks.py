@@ -490,9 +490,11 @@ async def execute_code(request: Request, job_id: str, body: ExecuteRequest | Non
                         # Re-upload source file for next attempt
                         with open(storage_path, "rb") as fh:
                             session_mgr.upload_file(sandbox_session, input_filename, fh.read())
-                        # Delete old output so we don't accidentally read stale data
+                        # Rename old output to a backup instead of deleting it — if later
+                        # attempts crash we can fall back to this best-so-far output.
                         if output_path_host.exists():
-                            output_path_host.unlink()
+                            backup = output_path_host.with_name("output_best.csv")
+                            output_path_host.rename(backup)
                     else:
                         sandbox_log += "[validation] LLM gave no fixed_code — stopping\n"
                         break
@@ -503,6 +505,25 @@ async def execute_code(request: Request, job_id: str, body: ExecuteRequest | Non
 
         finally:
             session_mgr.close_session(sandbox_session)
+
+        # ── If final output.csv is missing, restore the best-so-far backup ────
+        backup_path = output_path_host.with_name("output_best.csv")
+        if not output_path_host.exists() and backup_path.exists():
+            backup_path.rename(output_path_host)
+            sandbox_log += "\n[validation] ⚠ Later attempts crashed — restored best output from earlier attempt\n"
+            # Re-read cleaned_preview from the restored file
+            try:
+                with open(str(output_path_host), "r", encoding="utf-8-sig", errors="replace") as f:
+                    reader = csv.DictReader(f)
+                    rows = [dict(r) for i, r in enumerate(reader) if i < 100]
+                if rows:
+                    cleaned_preview = {
+                        "columns": list(rows[0].keys()),
+                        "sample_rows": rows[:20],
+                        "row_count": sum(1 for _ in open(str(output_path_host), encoding="utf-8-sig")) - 1,
+                    }
+            except Exception:
+                pass  # keep whatever cleaned_preview we already have
 
         # ── Persist everything ────────────────────────────────────────────────
         analysis = dict(job.analysis or {})
@@ -527,6 +548,280 @@ async def execute_code(request: Request, job_id: str, body: ExecuteRequest | Non
         }
     finally:
         session.close()
+
+
+# ─── Streaming sandbox execution endpoint ─────────────────────────────────────
+
+@router.post("/api/v1/jobs/{job_id}/execute/stream")
+async def execute_code_stream(request: Request, job_id: str, body: ExecuteRequest | None = None) -> StreamingResponse:
+    """
+    SSE streaming version of execute — yields progress events after each attempt
+    so the UI can show live status while the validation loop runs.
+
+    Events emitted:
+      attempt_start   → {"attempt": N, "total": 3, "message": "..."}
+      attempt_result  → {"attempt": N, "run_ok": true, "fill_rate": 0.84, "pass": false, "message": "..."}
+      attempt_crash   → {"attempt": N, "message": "..."}
+      llm_fixing      → {"attempt": N, "message": "Asking LLM to rewrite..."}
+      complete        → {status, sandbox_log, cleaned_preview, quality_report, validation_attempts}
+      error           → {"message": "..."}
+    """
+    import asyncio as _asyncio
+    import json as _json
+
+    def _sse(event: str, data: dict) -> str:
+        return f"event: {event}\ndata: {_json.dumps(data)}\n\n"
+
+    async def _generate():  # noqa: C901
+        loop = _asyncio.get_event_loop()
+        MAX_VALIDATION_ATTEMPTS = 3
+
+        session = get_db_session(request.app.state.db_session_factory)
+        try:
+            job = session.execute(select(Job).where(Job.id == job_id)).scalar_one_or_none()
+            if not job:
+                yield _sse("error", {"message": "Job not found."})
+                return
+
+            user_code = (body.code if body and body.code else None) or (job.analysis or {}).get("generated_code")
+            if not user_code:
+                yield _sse("error", {"message": "No code available — generate first."})
+                return
+
+            session_mgr = getattr(request.app.state, "session_manager", None)
+            if not session_mgr:
+                yield _sse("error", {"message": "Sandbox not available (Docker not running?)."})
+                return
+
+            storage_path = job.storage_path
+            if not storage_path or not Path(storage_path).exists():
+                yield _sse("error", {"message": "Source file not found on disk."})
+                return
+
+            schema = (job.analysis or {}).get("selected_schema") or (job.analysis or {}).get("schema_inference") or {}
+            raw_sample_rows = (job.result or {}).get("preview", {}).get("sample_rows", [])
+            file_type = (job.result or {}).get("file_type", "csv")
+            original_ext = Path(storage_path).suffix.lower() or ".csv"
+            input_filename = "input_file" + original_ext
+
+            client = request.app.state.llm_client
+            model = request.app.state.settings.azure_openai_deployment_gpt5_mini
+
+            sandbox_session = session_mgr.create_session()
+            output_path_host = Path(sandbox_session.workspace_dir) / "output.csv"
+
+            env_block = (
+                f'import os\n'
+                f'os.environ["INPUT_PATH"]  = "/sandbox/data/{input_filename}"\n'
+                f'os.environ["OUTPUT_PATH"] = "/sandbox/data/output.csv"\n'
+                f'os.environ["FILE_TYPE"]   = "{file_type}"\n\n'
+            )
+
+            sandbox_log = ""
+            cleaned_preview = None
+            quality_report = None
+            validation_attempts: list[dict] = []
+            current_code = user_code
+
+            try:
+                # Upload source file once
+                with open(storage_path, "rb") as fh:
+                    file_bytes = fh.read()
+                await loop.run_in_executor(
+                    None, lambda: session_mgr.upload_file(sandbox_session, input_filename, file_bytes)
+                )
+
+                for attempt in range(MAX_VALIDATION_ATTEMPTS):
+                    yield _sse("attempt_start", {
+                        "attempt": attempt + 1,
+                        "total": MAX_VALIDATION_ATTEMPTS,
+                        "message": f"Running script (attempt {attempt + 1}/{MAX_VALIDATION_ATTEMPTS})...",
+                    })
+
+                    attempt_log = f"\n{'='*60}\n--- ATTEMPT {attempt + 1}/{MAX_VALIDATION_ATTEMPTS} ---\n"
+                    run_ok = False
+
+                    # ── Run script ────────────────────────────────────────────
+                    try:
+                        wrapped = env_block + wrap_for_sandbox(current_code)
+                        run_output = await loop.run_in_executor(
+                            None,
+                            lambda w=wrapped: session_mgr.execute_code(sandbox_session, w, timeout_seconds=120),
+                        )
+                        attempt_log += run_output
+                        run_ok = True
+                    except Exception as run_err:
+                        attempt_log += f"EXECUTION ERROR: {run_err}"
+                        yield _sse("attempt_crash", {
+                            "attempt": attempt + 1,
+                            "message": str(run_err)[:300],
+                        })
+                        # Reflexion fix
+                        try:
+                            fix_prompt = build_codegen_reflexion_prompt(current_code, str(run_err))
+                            fix_resp = await loop.run_in_executor(
+                                None, lambda p=fix_prompt: client.responses.create(model=model, input=p)
+                            )
+                            current_code = parse_generated_code(fix_resp.output_text)
+                            attempt_log += "\n[reflexion fix applied — retrying next attempt]"
+                            with open(storage_path, "rb") as fh:
+                                fb = fh.read()
+                            await loop.run_in_executor(
+                                None, lambda: session_mgr.upload_file(sandbox_session, input_filename, fb)
+                            )
+                        except Exception as heal_err:
+                            attempt_log += f"\n[reflexion failed: {heal_err}]"
+                        sandbox_log += attempt_log
+                        validation_attempts.append({"attempt": attempt + 1, "run_ok": False, "verdict": "crash"})
+                        continue
+
+                    sandbox_log += attempt_log
+
+                    if not run_ok or not output_path_host.exists():
+                        validation_attempts.append({"attempt": attempt + 1, "run_ok": False, "verdict": "no_output"})
+                        yield _sse("attempt_crash", {"attempt": attempt + 1, "message": "Script ran but produced no output."})
+                        continue
+
+                    # ── Build cleaned preview ─────────────────────────────────
+                    with open(output_path_host, "r", encoding="utf-8-sig", errors="replace") as f:
+                        reader = csv.DictReader(f)
+                        rows = [dict(r) for i, r in enumerate(reader) if i < 100]
+                    cleaned_preview = {
+                        "columns": list(rows[0].keys()) if rows else [],
+                        "sample_rows": rows[:20],
+                        "row_count": sum(1 for _ in open(output_path_host, encoding="utf-8-sig")) - 1,
+                    }
+
+                    # ── Quality report ────────────────────────────────────────
+                    quality_report = compute_quality_report(output_path_host, schema)
+                    fill_pct = round(quality_report["overall_fill_rate"] * 100, 1)
+                    passed = quality_report["pass"]
+
+                    sandbox_log += (
+                        f"\n[quality] overall_fill={fill_pct}%  pass={passed}"
+                        f"  rows={quality_report['total_rows']}\n"
+                    )
+                    for cr in quality_report.get("columns", []):
+                        if cr.get("issues"):
+                            sandbox_log += f"  ⚠ {cr['name']}: {'; '.join(cr['issues'])}\n"
+
+                    validation_attempts.append({
+                        "attempt": attempt + 1,
+                        "run_ok": True,
+                        "verdict": "pass" if passed else "pending",
+                        "fill_rate": quality_report["overall_fill_rate"],
+                    })
+
+                    yield _sse("attempt_result", {
+                        "attempt": attempt + 1,
+                        "run_ok": True,
+                        "fill_rate": quality_report["overall_fill_rate"],
+                        "pass": passed,
+                        "message": "✅ Quality passed!" if passed else f"⚠ {fill_pct}% fill — quality issues found",
+                    })
+
+                    if passed:
+                        sandbox_log += "\n[validation] ✅ Quality check PASSED\n"
+                        break
+
+                    if attempt >= MAX_VALIDATION_ATTEMPTS - 1:
+                        sandbox_log += "\n[validation] ⚠ Max attempts reached — keeping best output\n"
+                        break
+
+                    # ── Ask LLM to fix ────────────────────────────────────────
+                    sandbox_log += "\n[validation] ❌ Quality issues — asking LLM to fix...\n"
+                    yield _sse("llm_fixing", {
+                        "attempt": attempt + 1,
+                        "message": "Asking LLM to rewrite the script for better date parsing...",
+                    })
+
+                    try:
+                        val_prompt = build_validation_prompt(schema, quality_report, current_code, raw_sample_rows)
+                        val_resp = await loop.run_in_executor(
+                            None, lambda p=val_prompt: client.responses.create(model=model, input=p)
+                        )
+                        verdict = parse_validation_response(val_resp.output_text)
+                        sandbox_log += f"[validation verdict] {verdict.get('verdict','?')}\n"
+
+                        if verdict.get("verdict") == "pass":
+                            sandbox_log += "[validation] LLM says quality is acceptable\n"
+                            break
+
+                        for iss in verdict.get("issues", []):
+                            sandbox_log += f"  LLM issue: {iss}\n"
+
+                        fixed_code = verdict.get("fixed_code", "")
+                        if fixed_code:
+                            current_code = parse_generated_code(fixed_code) if "```" in fixed_code else fixed_code
+                            sandbox_log += "[validation] LLM rewrote the script — retrying...\n"
+                            with open(storage_path, "rb") as fh:
+                                fb = fh.read()
+                            await loop.run_in_executor(
+                                None, lambda: session_mgr.upload_file(sandbox_session, input_filename, fb)
+                            )
+                            if output_path_host.exists():
+                                backup = output_path_host.with_name("output_best.csv")
+                                output_path_host.rename(backup)
+                        else:
+                            sandbox_log += "[validation] LLM gave no fixed_code — stopping\n"
+                            break
+
+                    except Exception as val_err:
+                        sandbox_log += f"[validation error] {val_err} — keeping current output\n"
+                        break
+
+            finally:
+                session_mgr.close_session(sandbox_session)
+
+            # Restore best backup if final output missing
+            backup_path = output_path_host.with_name("output_best.csv")
+            if not output_path_host.exists() and backup_path.exists():
+                backup_path.rename(output_path_host)
+                sandbox_log += "\n[validation] ⚠ Later attempts crashed — restored best output\n"
+                try:
+                    with open(str(output_path_host), "r", encoding="utf-8-sig", errors="replace") as f:
+                        reader = csv.DictReader(f)
+                        rows = [dict(r) for i, r in enumerate(reader) if i < 100]
+                    if rows:
+                        cleaned_preview = {
+                            "columns": list(rows[0].keys()),
+                            "sample_rows": rows[:20],
+                            "row_count": sum(1 for _ in open(str(output_path_host), encoding="utf-8-sig")) - 1,
+                        }
+                except Exception:
+                    pass
+
+            # Persist
+            analysis_dict = dict(job.analysis or {})
+            analysis_dict["execution_log"] = sandbox_log[-6000:]
+            analysis_dict["cleaned_preview"] = cleaned_preview
+            analysis_dict["quality_report"] = quality_report
+            analysis_dict["execution_ok"] = cleaned_preview is not None
+            analysis_dict["validation_attempts"] = validation_attempts
+            if current_code != user_code:
+                analysis_dict["generated_code"] = current_code
+                analysis_dict["self_healed"] = True
+            job.analysis = analysis_dict
+            session.commit()
+
+            yield _sse("complete", {
+                "status": "ok" if cleaned_preview else "error",
+                "sandbox_log": sandbox_log[-3000:],
+                "cleaned_preview": cleaned_preview,
+                "quality_report": quality_report,
+                "validation_attempts": validation_attempts,
+            })
+
+        except Exception as exc:
+            yield _sse("error", {"message": str(exc)})
+        finally:
+            session.close()
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
 
 
 # ─── Download cleaned CSV ──────────────────────────────────────────────────────

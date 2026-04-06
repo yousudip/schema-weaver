@@ -137,7 +137,7 @@ function ToastContainer({ toasts, dismiss }: { toasts: Toast[]; dismiss: (id: st
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
 function App() {
-  const [apiBase, setApiBase] = useState(import.meta.env.VITE_API_BASE || 'http://localhost:8000')
+  const [apiBase, setApiBase] = useState(import.meta.env.VITE_API_BASE || 'http://localhost:8010')
   const [file, setFile] = useState<File | null>(null)
   const [jobId, setJobId] = useState('')
   const [status, setStatus] = useState('idle')
@@ -162,6 +162,7 @@ function App() {
   const [qualityReport, setQualityReport] = useState<QualityReportData | null>(null)
   const [validationAttempts, setValidationAttempts] = useState<ValidationAttempt[]>([])
   const [codeEdited, setCodeEdited] = useState(false)
+  const [executeProgress, setExecuteProgress] = useState<string[]>([])
   const [showEventLog, setShowEventLog] = useState(false)
   const [showRawResult, setShowRawResult] = useState(false)
   const [showApiConfig, setShowApiConfig] = useState(false)
@@ -253,6 +254,13 @@ function App() {
   }
 
   useEffect(() => { fetchJobs() }, [apiBase])
+
+  // Auto-refresh sidebar job list while sandbox is running so the status dot updates
+  useEffect(() => {
+    if (executeStatus !== 'running') return
+    const id = setInterval(fetchJobs, 3000)
+    return () => clearInterval(id)
+  }, [executeStatus])
 
   async function handleRefresh() {
     if (!jobId) return
@@ -377,38 +385,85 @@ function App() {
     setCleanedPreview(null)
     setQualityReport(null)
     setValidationAttempts([])
+    setExecuteProgress([])
     addToast('info', 'Running script in Docker sandbox...')
     try {
-      const body = codeEdited ? JSON.stringify({ code: generatedCode }) : '{}'
-      const res = await fetch(`${apiBase}/api/v1/jobs/${jobId}/execute`, {
+      const reqBody = codeEdited ? JSON.stringify({ code: generatedCode }) : '{}'
+      const res = await fetch(`${apiBase}/api/v1/jobs/${jobId}/execute/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body,
+        body: reqBody,
       })
-      if (!res.ok) { setExecuteStatus('error'); addToast('error', 'Execution request failed.'); return }
-      const data = await res.json()
-      setSandboxLog(data.sandbox_log || '')
-      setAnalysis(data.analysis || analysis)
-      if (data.quality_report) setQualityReport(data.quality_report)
-      if (data.validation_attempts) setValidationAttempts(data.validation_attempts)
-      if (data.status !== 'ok' || !data.cleaned_preview) {
-        setExecuteStatus('error')
-        addToast('error', 'Sandbox execution failed — check log for details.')
-        return
+      if (!res.ok || !res.body) { setExecuteStatus('error'); fetchJobs(); addToast('error', 'Execution request failed.'); return }
+
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const parts = buffer.split('\n\n')
+        buffer = parts.pop() ?? ''
+
+        for (const part of parts) {
+          let eventType = 'message'
+          let dataLine = ''
+          for (const line of part.split('\n')) {
+            if (line.startsWith('event: ')) eventType = line.slice(7).trim()
+            if (line.startsWith('data: ')) dataLine = line.slice(6).trim()
+          }
+          if (!dataLine) continue
+          try {
+            const data = JSON.parse(dataLine)
+            if (eventType === 'attempt_start') {
+              setExecuteProgress(prev => [...prev, `🔄 Attempt ${data.attempt}/${data.total}: Running script...`])
+            } else if (eventType === 'attempt_result') {
+              const fillPct = Math.round((data.fill_rate ?? 0) * 100)
+              const icon = data.pass ? '✅' : '⚠️'
+              setExecuteProgress(prev => [...prev, `${icon} Attempt ${data.attempt}: ${fillPct}% fill${data.pass ? ' — passed!' : ' — quality issues, fixing...'}`])
+              setValidationAttempts(prev => {
+                const next = prev.filter(a => a.attempt !== data.attempt)
+                return [...next, { attempt: data.attempt, run_ok: true, verdict: data.pass ? 'pass' : 'pending', fill_rate: data.fill_rate }]
+              })
+            } else if (eventType === 'attempt_crash') {
+              setExecuteProgress(prev => [...prev, `💥 Attempt ${data.attempt}: Crashed — applying reflexion fix...`])
+              setValidationAttempts(prev => {
+                const next = prev.filter(a => a.attempt !== data.attempt)
+                return [...next, { attempt: data.attempt, run_ok: false, verdict: 'crash' }]
+              })
+            } else if (eventType === 'llm_fixing') {
+              setExecuteProgress(prev => [...prev, `🤖 Attempt ${data.attempt}: Asking LLM to rewrite script...`])
+            } else if (eventType === 'complete') {
+              setSandboxLog(data.sandbox_log || '')
+              if (data.quality_report) setQualityReport(data.quality_report)
+              if (data.validation_attempts) setValidationAttempts(data.validation_attempts)
+              if (data.status !== 'ok' || !data.cleaned_preview) {
+                setExecuteStatus('error'); fetchJobs()
+                addToast('error', 'Sandbox execution failed — check log for details.')
+              } else {
+                setCleanedPreview(data.cleaned_preview)
+                setExecuteStatus('ok'); fetchJobs()
+                const qr = data.quality_report
+                const fillPct = qr ? Math.round(qr.overall_fill_rate * 100) : 100
+                const passed = qr?.pass !== false
+                addToast('success', `✅ ${data.cleaned_preview.row_count} rows cleaned · ${fillPct}% fill rate${passed ? '' : ' ⚠ quality issues found'}`)
+              }
+            } else if (eventType === 'error') {
+              setExecuteStatus('error'); fetchJobs()
+              addToast('error', `Execution error: ${data.message}`)
+            }
+          } catch { /* ignore SSE parse errors */ }
+        }
       }
-      setCleanedPreview(data.cleaned_preview)
-      setExecuteStatus('ok')
-      const qr = data.quality_report
-      const fillPct = qr ? Math.round(qr.overall_fill_rate * 100) : 100
-      const passed = qr?.pass !== false
-      addToast('success', `✅ ${data.cleaned_preview.row_count} rows cleaned · ${fillPct}% fill rate${passed ? '' : ' ⚠ quality issues found'}`)
-    } catch { setExecuteStatus('error'); addToast('error', 'Network error during execution.') }
+    } catch { setExecuteStatus('error'); fetchJobs(); addToast('error', 'Network error during execution.') }
   }
 
   function resetAll() {
     setGenerateStatus('idle'); setExecuteStatus('idle')
     setGeneratedCode(''); setSandboxLog(''); setCleanedPreview(null); setCodeEdited(false)
-    setQualityReport(null); setValidationAttempts([])
+    setQualityReport(null); setValidationAttempts([]); setExecuteProgress([])
   }
 
   async function handleSelectJob(id: string) {
@@ -493,7 +548,7 @@ function App() {
         <section className="panel panel-config">
           <label className="config-label">
             API Base URL
-            <input type="text" value={apiBase} onChange={e => setApiBase(e.target.value)} placeholder="http://localhost:8000" />
+            <input type="text" value={apiBase} onChange={e => setApiBase(e.target.value)} placeholder="http://localhost:8010" />
           </label>
         </section>
       )}
@@ -832,6 +887,14 @@ function App() {
                     <div className="progress-banner">
                       <div className="progress-bar-indeterminate" />
                       <span>Executing in isolated Docker container…</span>
+                      {executeProgress.length > 0 && (
+                        <div className="execute-progress-live">
+                          {executeProgress.map((line, i) => (
+                            <div key={i} className="execute-progress-line">{line}</div>
+                          ))}
+                          <div className="execute-progress-line execute-progress-dots">⏳ working…</div>
+                        </div>
+                      )}
                     </div>
                   )}
                   {executeStatus === 'error' && (

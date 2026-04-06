@@ -64,8 +64,38 @@ file_type    # str — one of "csv", "excel", "pdf"
 2. **Select & rename** — keep ONLY the source columns listed above and rename
    them to their target names. Use `df.rename(columns={{...}})`.
 3. **Clean each column by inferred type**:
-   - `date` → `pd.to_datetime(col, errors='coerce')` (pandas 2.x — do NOT use
-     `infer_datetime_format` which was removed) then `.dt.strftime('%Y-%m-%d')`.
+   - `date` → Use this exact robust multi-pass helper. Input files often contain a MIX
+     of formats in the same column (e.g. "01/22/2025" US-style AND "15/01/2025" EU-style
+     AND "January 8 2025" AND "2025-01-10 00:00:00" Excel datetime strings AND Excel
+     serial integers like 45657). A single dayfirst setting cannot handle all of them.
+     Use this exact function — copy it verbatim:
+     ```python
+     def parse_dates(col):
+         s = col.astype(str).str.strip()
+         # 1. Blank / null guard
+         is_blank = s.isin(['', 'nan', 'NaT', 'None', 'NaN'])
+         result = pd.Series(pd.NaT, index=s.index, dtype='datetime64[ns]')
+         # 2. Excel serial integers (5-digit, e.g. 45657)
+         numeric = pd.to_numeric(s, errors='coerce')
+         is_serial = numeric.notna() & (numeric > 40000) & (numeric < 60000)
+         if is_serial.any():
+             result[is_serial] = pd.Timestamp('1899-12-30') + pd.to_timedelta(numeric[is_serial], unit='D')
+         # 3. Strip trailing time from Excel datetime strings "2025-01-05 00:00:00"
+         s = s.str.replace(r'\\s+\\d{{2}}:\\d{{2}}:\\d{{2}}(\\.\\d+)?$', '', regex=True).str.strip()
+         # 4. Parse remaining (not serial, not blank) with dayfirst=False (handles MM/DD/YYYY)
+         mask = ~is_serial & ~is_blank & result.isna()
+         if mask.any():
+             parsed_mf = pd.to_datetime(s[mask], format='mixed', dayfirst=False, errors='coerce')
+             result[mask] = parsed_mf
+         # 5. For still-NaT entries retry with dayfirst=True (handles DD/MM/YYYY like 15/01/2025)
+         still_nat = ~is_serial & ~is_blank & result.isna()
+         if still_nat.any():
+             parsed_df = pd.to_datetime(s[still_nat], format='mixed', dayfirst=True, errors='coerce')
+             result[still_nat] = parsed_df
+         return result.dt.strftime('%Y-%m-%d').where(result.notna(), other=pd.NA)
+     df['col'] = parse_dates(df['col'])
+     ```
+     Do NOT use `infer_datetime_format` (removed in pandas 2.x).
    - `currency` / `number` → strip `$£€,` and whitespace, coerce to float with
      `pd.to_numeric(col.str.replace(r'[^\\d.\\-]','',regex=True), errors='coerce')`.
    - `string` → `.str.strip()`.  For status-like columns (≤10 unique values)
@@ -154,51 +184,110 @@ Column details (only columns with fill < 100% or issues shown):
    complete fixed script.
 
 ## Critical date-parsing rules (apply when dates are failing):
-- Excel `.xlsx` files often store dates as **5-digit integer serial numbers**
-  (e.g. 45657). When read with `dtype=str` these come through as "45657".
-  To convert: `pd.to_datetime('1899-12-30') + pd.to_timedelta(pd.to_numeric(col, errors='coerce'), unit='D')`
-- For mixed-format string dates (DD/MM/YYYY, MM-DD-YY, etc.) try:
-  `pd.to_datetime(col, dayfirst=True, errors='coerce')`
-  then fall back to: `pd.to_datetime(col, format='mixed', dayfirst=True, errors='coerce')`
+- Excel datetime strings come through as "2025-01-05 00:00:00" — strip the time part first:
+  `s = s.str.replace(r'\\s+\\d{{2}}:\\d{{2}}:\\d{{2}}(\\.\\d+)?$', '', regex=True)`
+- Excel `.xlsx` files often store dates as **5-digit integer serial numbers** (e.g. 45657).
+  Detect with: `numeric.notna() & (numeric > 40000) & (numeric < 60000)`
+  Convert with: `pd.Timestamp('1899-12-30') + pd.to_timedelta(numeric, unit='D')`
+- For mixed string formats (DD/MM/YYYY, "January 25 2025", MM/DD/YYYY, ISO, etc.) use:
+  `pd.to_datetime(col, format='mixed', dayfirst=True, errors='coerce')`
 - NEVER use `infer_datetime_format=True` (removed in pandas 2.x).
-- For a column that has BOTH serial integers AND string dates, detect and branch:
+- The input data often has MIXED date formats in the same column (MM/DD/YYYY AND DD/MM/YYYY
+  AND long month names AND Excel serial integers AND datetime strings). A single dayfirst
+  setting will fail on half the rows. Always use this multi-pass helper:
   ```python
-  def parse_mixed_dates(s):
+  def parse_dates(col):
+      s = col.astype(str).str.strip()
+      is_blank = s.isin(['', 'nan', 'NaT', 'None', 'NaN'])
+      result = pd.Series(pd.NaT, index=s.index, dtype='datetime64[ns]')
       numeric = pd.to_numeric(s, errors='coerce')
-      result = pd.Series(index=s.index, dtype='object')
       is_serial = numeric.notna() & (numeric > 40000) & (numeric < 60000)
-      result[is_serial] = (
-          pd.Timestamp('1899-12-30') + pd.to_timedelta(numeric[is_serial], unit='D')
-      )
-      result[~is_serial] = pd.to_datetime(s[~is_serial], errors='coerce')
-      return pd.to_datetime(result, errors='coerce')
+      if is_serial.any():
+          result[is_serial] = pd.Timestamp('1899-12-30') + pd.to_timedelta(numeric[is_serial], unit='D')
+      s = s.str.replace(r'\\s+\\d{{2}}:\\d{{2}}:\\d{{2}}(\\.\\d+)?$', '', regex=True).str.strip()
+      mask = ~is_serial & ~is_blank & result.isna()
+      if mask.any():
+          result[mask] = pd.to_datetime(s[mask], format='mixed', dayfirst=False, errors='coerce')
+      still_nat = ~is_serial & ~is_blank & result.isna()
+      if still_nat.any():
+          result[still_nat] = pd.to_datetime(s[still_nat], format='mixed', dayfirst=True, errors='coerce')
+      return result.dt.strftime('%Y-%m-%d').where(result.notna(), other=pd.NA)
   ```
 
 ## Response format
-Respond with ONLY a JSON object — no markdown, no prose:
+If quality is acceptable:
+```json
 {{"verdict": "pass"}}
-or
-{{"verdict": "fail", "issues": ["issue 1", "issue 2"], "fixed_code": "...full python script..."}}
+```
 
-The fixed_code must be a complete, standalone script (same structure as the original).
+If quality needs fixing, respond in this exact two-part format:
+```json
+{{"verdict": "fail", "issues": ["issue 1", "issue 2"]}}
+```
+```python
+# ... complete fixed standalone Python script here ...
+```
+
+IMPORTANT: Put the Python script in a separate ```python block, NOT inside the JSON.
+The fixed script must be complete and standalone (same structure as the original).
+
+## Hard constraints for the fixed script (violations cause immediate crash):
+- FORBIDDEN calls: `open()`, `exec()`, `eval()`, `compile()`, `__import__()`
+- FORBIDDEN modules: `subprocess`, `socket`, `os.system`, `sys.exit`
+- All file I/O MUST go through pandas (`pd.read_csv`, `pd.read_excel`, `df.to_csv`)
+- Allowed imports ONLY: `pandas`, `numpy`, `re`, `datetime`, `json`, `math`, `pathlib`, `os`, `sys`
 """
 
 
 def parse_validation_response(text: str) -> dict:
-    """Extract the JSON verdict from the LLM validation response."""
+    """
+    Extract the JSON verdict from the LLM validation response.
+
+    The LLM often embeds a full Python script inside the JSON string, which
+    breaks standard json.loads (unescaped newlines/quotes).  We therefore:
+      1. Try normal json.loads on the whole block.
+      2. If that fails, extract verdict + issues with regex, then look for
+         the fixed_code in a ```python ... ``` fence that follows the JSON.
+      3. Fallback is "fail" (not "pass") so we never silently accept bad output.
+    """
     import json as _json
-    # Strip markdown code fences if present
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    # Find first { ... } block
+
+    original = text.strip()
+
+    # ── 1. Strip outer markdown fences ───────────────────────────────────────
+    text = re.sub(r"^```(?:json)?\s*", "", original)
+    text = re.sub(r"\s*```$", "", text).strip()
+
+    # ── 2. Happy-path: valid JSON ─────────────────────────────────────────────
     m = re.search(r"\{.*\}", text, re.DOTALL)
     if m:
         try:
             return _json.loads(m.group(0))
         except _json.JSONDecodeError:
             pass
-    return {"verdict": "pass"}   # safe fallback — don't block on parse error
+
+    # ── 3. Degraded parse: extract verdict + issues with regex ────────────────
+    verdict_m = re.search(r'"verdict"\s*:\s*"(pass|fail)"', original)
+    if not verdict_m:
+        # Cannot determine verdict — assume fail so loop retries
+        return {"verdict": "fail", "issues": ["[parse error] Could not determine verdict"]}
+
+    verdict = verdict_m.group(1)
+    if verdict == "pass":
+        return {"verdict": "pass"}
+
+    # Extract issues array (best-effort)
+    issues: list[str] = []
+    issues_m = re.search(r'"issues"\s*:\s*\[([^\]]*)\]', original, re.DOTALL)
+    if issues_m:
+        for item in re.findall(r'"((?:[^"\\]|\\.)*)"', issues_m.group(1)):
+            issues.append(item)
+
+    # Extract fixed_code from a ```python fence that appears anywhere in the response
+    code_m = re.search(r"```python\s*(.*?)```", original, re.DOTALL)
+    fixed_code = code_m.group(1).strip() if code_m else ""
+
+    return {"verdict": "fail", "issues": issues, "fixed_code": fixed_code}
 
 
 def build_codegen_reflexion_prompt(
@@ -222,7 +311,9 @@ def build_codegen_reflexion_prompt(
 Diagnose the error and rewrite the complete fixed script.
 Remember:
 - `input_path`, `output_path`, and `file_type` are pre-defined strings.
-- Only pandas, numpy, re, datetime, json, math, pathlib are available.
+- Only pandas, numpy, re, datetime, json, math, pathlib, os, sys are available.
+- FORBIDDEN: `open()`, `exec()`, `eval()`, `compile()`, `subprocess`, `socket` — these trigger static analysis failure.
+- All file I/O must go through pandas (`pd.read_csv`, `pd.read_excel`, `df.to_csv`).
 - Return ONLY the fixed Python code inside a ```python ... ``` block.
 """
 
