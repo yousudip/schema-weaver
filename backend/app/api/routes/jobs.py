@@ -217,6 +217,7 @@ async def list_job_files(request: Request, job_id: str) -> Dict:
                 "has_preview": f.result is not None,
                 "has_schema": f.analysis is not None and "schema_inference" in (f.analysis or {}),
                 "has_code": f.analysis is not None and "generated_code" in (f.analysis or {}),
+                "execution_ok": bool((f.analysis or {}).get("execution_ok")),
                 "quality_report": (f.analysis or {}).get("quality_report"),
                 "validation_attempts": (f.analysis or {}).get("validation_attempts", []),
                 "created_at": f.created_at.isoformat() if f.created_at else None,

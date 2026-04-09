@@ -40,6 +40,8 @@ from backend.app.llm.codegen import (
     parse_generated_code,
     parse_validation_response,
     wrap_for_sandbox,
+    build_consolidation_prompt,
+    parse_consolidation_mapping,
 )
 from backend.app.llm.quality import compute_quality_report
 
@@ -453,6 +455,18 @@ async def execute_file_stream(
                 except Exception:
                     pass
 
+            # Persist cleaned output CSV to a stable per-file location for consolidation
+            output_csv_path: str | None = None
+            if cleaned_preview and output_path_host.exists():
+                import shutil as _shutil
+                persistent_dir = Path(storage_path).parent
+                persistent_out = persistent_dir / f"{file_id}-output.csv"
+                try:
+                    _shutil.copy2(output_path_host, persistent_out)
+                    output_csv_path = str(persistent_out)
+                except Exception:
+                    pass
+
             # Persist to JobFile
             analysis_dict = dict(jf.analysis or {})
             analysis_dict["execution_log"] = sandbox_log[-6000:]
@@ -460,6 +474,8 @@ async def execute_file_stream(
             analysis_dict["quality_report"] = quality_report
             analysis_dict["execution_ok"] = cleaned_preview is not None
             analysis_dict["validation_attempts"] = validation_attempts
+            if output_csv_path:
+                analysis_dict["output_csv_path"] = output_csv_path
             if current_code != user_code:
                 analysis_dict["generated_code"] = current_code
                 analysis_dict["self_healed"] = True
@@ -644,16 +660,32 @@ async def download_file_output(request: Request, job_id: str, file_id: str) -> S
         session.close()
 
     settings = request.app.state.settings
-    sandbox_root = Path(settings.local_storage_dir) / "sandbox"
+
+    # Prefer the persistent per-file output saved after execution
+    output_csv_path_str = None
+    session2 = get_db_session(request.app.state.db_session_factory)
+    try:
+        _, jf2 = _get_job_and_file(session2, job_id, file_id)
+        output_csv_path_str = (jf2.analysis or {}).get("output_csv_path")
+    finally:
+        session2.close()
+
     output_file: Path | None = None
-    if sandbox_root.exists():
-        candidates = sorted(
-            sandbox_root.glob("*/output.csv"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        if candidates:
-            output_file = candidates[0]
+    if output_csv_path_str:
+        p = Path(output_csv_path_str)
+        if p.exists():
+            output_file = p
+
+    if not output_file:
+        sandbox_root = Path(settings.local_storage_dir) / "sandbox"
+        if sandbox_root.exists():
+            candidates = sorted(
+                sandbox_root.glob("*/output.csv"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if candidates:
+                output_file = candidates[0]
 
     if not output_file or not output_file.exists():
         rows = cleaned_preview.get("sample_rows", [])
@@ -679,4 +711,251 @@ async def download_file_output(request: Request, job_id: str, file_id: str) -> S
         file_streamer(),
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename_stem}_cleaned.csv"'},
+    )
+
+
+# ─── Consolidation ─────────────────────────────────────────────────────────────
+
+@router.post("/api/v1/jobs/{job_id}/consolidate/stream")
+async def consolidate_job_stream(request: Request, job_id: str) -> StreamingResponse:
+    """
+    SSE streaming endpoint that:
+    1. Collects all validated JobFiles with a persistent output CSV.
+    2. Asks the LLM to map columns to a unified canonical schema.
+    3. Reads each file, renames columns per the mapping, and pd.concats.
+    4. Saves the merged CSV and stores the result in job.analysis.
+
+    All blocking I/O (LLM call, pandas, file writes, DB commits) runs in
+    asyncio.to_thread so the event loop is never blocked.
+    """
+    import asyncio as _asyncio
+    import json as _json
+    import math as _math
+    import pandas as _pd
+
+    def _sse(event: str, data: dict) -> str:
+        return f"event: {event}\ndata: {_json.dumps(data)}\n\n"
+
+    def _sanitize(val):
+        """Replace NaN/Inf float with None so PostgreSQL JSON accepts it."""
+        if isinstance(val, float) and not _math.isfinite(val):
+            return None
+        return val
+
+    async def _generate():
+        # ── Step 1: Read DB data (quick), then close session immediately ──────
+        def _read_db():
+            session = get_db_session(request.app.state.db_session_factory)
+            try:
+                job = session.execute(select(Job).where(Job.id == job_id)).scalar_one_or_none()
+                if not job:
+                    return None, []
+                files = session.execute(
+                    select(JobFile).where(JobFile.job_id == job_id)
+                ).scalars().all()
+                # Materialise the data we need before closing
+                job_data = {"id": job.id, "purpose": job.purpose, "analysis": dict(job.analysis or {})}
+                files_data = [
+                    {
+                        "id": jf.id,
+                        "filename": jf.filename,
+                        "analysis": dict(jf.analysis or {}),
+                    }
+                    for jf in files
+                ]
+                return job_data, files_data
+            finally:
+                session.close()
+
+        job_data, files_data = await _asyncio.to_thread(_read_db)
+
+        if job_data is None:
+            yield _sse("error", {"message": "Job not found."})
+            return
+
+        # Filter to files that have been executed with data available
+        ready_files = [
+            f for f in files_data
+            if f["analysis"].get("execution_ok")
+            and (
+                (f["analysis"].get("output_csv_path") and Path(f["analysis"]["output_csv_path"]).exists())
+                or f["analysis"].get("cleaned_preview", {}).get("sample_rows")
+            )
+        ]
+
+        if not ready_files:
+            yield _sse("error", {"message": "No executed files found. Run Execute on each file first."})
+            return
+
+        yield _sse("progress", {
+            "message": f"Found {len(ready_files)} executed file(s). Mapping columns…",
+            "step": "mapping",
+        })
+
+        # ── Step 2: Build schema list (may open files for header reading) ─────
+        def _build_schemas():
+            schemas = []
+            for f in ready_files:
+                cols = f["analysis"].get("cleaned_preview", {}).get("columns", [])
+                if not cols:
+                    try:
+                        with open(f["analysis"]["output_csv_path"], encoding="utf-8-sig") as fh:
+                            cols = fh.readline().strip().split(",")
+                    except Exception:
+                        cols = []
+                schemas.append({"file_id": f["id"], "filename": f["filename"], "columns": cols})
+            return schemas
+
+        file_schemas = await _asyncio.to_thread(_build_schemas)
+
+        # ── Step 3: LLM column mapping (slow network call) ────────────────────
+        client = request.app.state.llm_client
+        model = request.app.state.settings.azure_openai_deployment_gpt5_mini
+        prompt = build_consolidation_prompt(file_schemas, purpose=job_data["purpose"])
+
+        try:
+            llm_resp = await _asyncio.to_thread(
+                lambda: client.responses.create(model=model, input=prompt)
+            )
+            mapping = parse_consolidation_mapping(llm_resp.output_text)
+        except Exception as e:
+            yield _sse("error", {"message": f"LLM mapping failed: {e}"})
+            return
+
+        canonical_columns: list[str] = mapping.get("canonical_columns", [])
+        file_mappings: dict = mapping.get("file_mappings", {})
+        notes: str = mapping.get("notes", "")
+
+        yield _sse("progress", {
+            "message": f"Column mapping complete — {len(canonical_columns)} unified columns. Merging files…",
+            "step": "merging",
+            "canonical_columns": canonical_columns,
+            "file_mappings": file_mappings,
+            "notes": notes,
+        })
+
+        # ── Step 4: Read CSVs, merge, write output (blocking I/O in thread) ───
+        def _merge_and_save():
+            frames = []
+            merge_errors = []
+            for f in ready_files:
+                try:
+                    output_csv = f["analysis"].get("output_csv_path", "")
+                    if output_csv and Path(output_csv).exists():
+                        df = _pd.read_csv(output_csv, dtype=str, encoding="utf-8-sig")
+                    else:
+                        preview = f["analysis"].get("cleaned_preview", {})
+                        rows = preview.get("sample_rows", [])
+                        cols = preview.get("columns", [])
+                        df = _pd.DataFrame(rows, columns=cols) if rows else _pd.DataFrame(columns=cols)
+                    col_map = file_mappings.get(f["id"], {})
+                    if col_map:
+                        df = df.rename(columns=col_map)
+                    df["_source_file"] = f["filename"]
+                    frames.append(df)
+                except Exception as e:
+                    merge_errors.append(f"{f['filename']}: {e}")
+
+            if not frames:
+                return None, merge_errors, None, None
+
+            merged = _pd.concat(frames, ignore_index=True, sort=False)
+
+            # Reorder: canonical columns first, then extras, then _source_file
+            ordered = [c for c in canonical_columns if c in merged.columns]
+            extra = [c for c in merged.columns if c not in canonical_columns and c != "_source_file"]
+            merged = merged.reindex(columns=ordered + extra + ["_source_file"])
+
+            # Save consolidated CSV
+            job_dir = Path(request.app.state.settings.local_storage_dir) / "jobs" / job_id
+            job_dir.mkdir(parents=True, exist_ok=True)
+            consolidated_path = job_dir / "consolidated.csv"
+            merged.to_csv(consolidated_path, index=False, encoding="utf-8-sig")
+
+            # Build preview with NaN → None sanitization
+            preview_rows = [
+                {k: _sanitize(v) for k, v in row.items()}
+                for row in merged.head(20).to_dict(orient="records")
+            ]
+            preview = {
+                "columns": list(merged.columns),
+                "sample_rows": preview_rows,
+                "row_count": len(merged),
+                "file_count": len(frames),
+            }
+            return preview, merge_errors, str(consolidated_path), merged
+
+        consolidated_preview, merge_errors, consolidated_path_str, _ = await _asyncio.to_thread(_merge_and_save)
+
+        if consolidated_preview is None:
+            yield _sse("error", {"message": f"Could not read any files. Errors: {merge_errors}"})
+            return
+
+        # ── Step 5: Persist to DB (new short-lived session) ───────────────────
+        def _save_to_db():
+            from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+            session = get_db_session(request.app.state.db_session_factory)
+            try:
+                job = session.execute(select(Job).where(Job.id == job_id)).scalar_one_or_none()
+                if job:
+                    job_analysis = dict(job.analysis or {})
+                    job_analysis["consolidated_csv_path"] = consolidated_path_str
+                    job_analysis["consolidated_preview"] = consolidated_preview
+                    job_analysis["column_mapping"] = mapping
+                    job_analysis["merge_errors"] = merge_errors
+                    job.analysis = job_analysis
+                    _flag_modified(job, "analysis")
+                    session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+        try:
+            await _asyncio.to_thread(_save_to_db)
+        except Exception as e:
+            yield _sse("error", {"message": f"DB save failed: {e}"})
+            return
+
+        yield _sse("complete", {
+            "status": "ok",
+            "consolidated_preview": consolidated_preview,
+            "column_mapping": mapping,
+            "merge_errors": merge_errors,
+            "message": f"Merged {len(ready_files)} files → {consolidated_preview['row_count']} rows, {len(consolidated_preview['columns'])} columns.",
+        })
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/api/v1/jobs/{job_id}/consolidate/download")
+async def download_consolidated(request: Request, job_id: str) -> StreamingResponse:
+    """Download the merged consolidated CSV for a job."""
+    session = get_db_session(request.app.state.db_session_factory)
+    try:
+        job = session.execute(select(Job).where(Job.id == job_id)).scalar_one_or_none()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found.")
+        path_str = (job.analysis or {}).get("consolidated_csv_path")
+        job_name = (job.name or job_id).replace(" ", "_")[:40]
+    finally:
+        session.close()
+
+    if not path_str or not Path(path_str).exists():
+        raise HTTPException(status_code=404, detail="No consolidated file — run consolidate first.")
+
+    def streamer():
+        with open(path_str, "rb") as f:
+            while chunk := f.read(65536):
+                yield chunk
+
+    return StreamingResponse(
+        streamer(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{job_name}_consolidated.csv"'},
     )

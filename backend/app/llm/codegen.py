@@ -354,3 +354,59 @@ file_type   = os.environ.get("FILE_TYPE",   "csv")
 def wrap_for_sandbox(user_code: str) -> str:
     """Prepend the standard preamble so input_path / output_path are available."""
     return SANDBOX_PREAMBLE + user_code
+
+
+# ─── Consolidation column-mapping prompt ─────────────────────────────────────
+
+def build_consolidation_prompt(
+    file_schemas: list[dict],  # [{file_id, filename, columns: [str]}]
+    purpose: str | None = None,
+) -> str:
+    """Ask the LLM to produce a unified column mapping across all cleaned files."""
+    purpose_line = f"Job purpose: {purpose}\n" if purpose else ""
+
+    files_section = ""
+    for i, fs in enumerate(file_schemas, 1):
+        cols = ", ".join(fs["columns"])
+        files_section += f"File {i} — {fs['filename']} (id: {fs['file_id']}):\n  Columns: {cols}\n\n"
+
+    return f"""{purpose_line}
+You are a data integration expert. The following cleaned CSV files belong to the same job and need to be merged into a single unified table.
+
+{files_section}
+Your task:
+1. Decide on a set of **canonical column names** that cover all meaningful columns across all files.
+2. For each file, map its column names to the canonical names (or null if a column has no equivalent).
+
+Rules:
+- Use snake_case for all canonical column names.
+- If the same data appears under different names across files (e.g. "vendor" vs "supplier_name"), unify them under one canonical name.
+- If a column is unique to one file, still include it in the canonical set.
+- Keep the order logical (identifiers first, then dates, amounts, then metadata).
+- Do NOT invent columns that don't exist in the source files.
+
+Respond with ONLY a valid JSON object in this exact format:
+{{
+  "canonical_columns": ["col_a", "col_b", ...],
+  "file_mappings": {{
+    "<file_id_1>": {{"source_col": "canonical_col", ...}},
+    "<file_id_2>": {{"source_col": "canonical_col", ...}}
+  }},
+  "notes": "brief explanation of key decisions"
+}}
+"""
+
+
+def parse_consolidation_mapping(text: str) -> dict:
+    """Extract the JSON mapping from an LLM consolidation response."""
+    # strip markdown fences
+    m = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    raw = m.group(1).strip() if m else text.strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # best-effort: find the first { ... }
+        m2 = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m2:
+            return json.loads(m2.group(0))
+        raise

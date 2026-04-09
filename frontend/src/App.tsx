@@ -42,6 +42,7 @@ interface JobFileEntry {
   has_preview: boolean
   has_schema: boolean
   has_code: boolean
+  execution_ok: boolean
   quality_report: QualityReportData | null
   validation_attempts: ValidationAttempt[]
   created_at: string | null
@@ -202,6 +203,14 @@ function App() {
   // Batch processing
   const [showBatchModal, setShowBatchModal] = useState(false)
   const [batchRunning, setBatchRunning] = useState(false)
+  // Consolidation
+  const [consolidating, setConsolidating] = useState(false)
+  const [consolidationResult, setConsolidationResult] = useState<{
+    consolidated_preview: { columns: string[]; sample_rows: Record<string, string>[]; row_count: number; file_count: number }
+    column_mapping: { canonical_columns: string[]; file_mappings: Record<string, Record<string, string>>; notes?: string }
+    merge_errors: string[]
+    message: string
+  } | null>(null)
 
   // ── Toast helpers ──────────────────────────────────────────────────────────
   const addToast = useCallback((type: ToastType, message: string) => {
@@ -517,6 +526,7 @@ function App() {
     setMappings([]); setColumnStates({})
     setActiveJobPurpose(null); setJobFiles([])
     setFileProgress({}); setFileStatus({})
+    setConsolidationResult(null)
     resetAll()
 
     try {
@@ -535,6 +545,16 @@ function App() {
     if (job.purpose) {
       setActiveJobPurpose(job.purpose)
       setResult(null); setAnalysis(null)
+      // Hydrate consolidation result if a previous consolidation exists
+      const ja = job.analysis || {}
+      if (ja.consolidated_preview && ja.column_mapping) {
+        setConsolidationResult({
+          consolidated_preview: ja.consolidated_preview,
+          column_mapping: ja.column_mapping,
+          merge_errors: ja.merge_errors || [],
+          message: ja.consolidation_message || 'Previously consolidated output',
+        })
+      }
       fetchJobFiles(id)
       return
     }
@@ -926,6 +946,46 @@ function App() {
     fetchJobFiles(jobId)
   }
 
+  // ── Consolidation ─────────────────────────────────────────────────────────
+  async function handleConsolidate() {
+    if (!jobId) return
+    setConsolidating(true)
+    setConsolidationResult(null)
+    try {
+      const res = await fetch(`${apiBase}/api/v1/jobs/${jobId}/consolidate/stream`, { method: 'POST' })
+      if (!res.ok || !res.body) { addToast('error', 'Consolidation failed to start.'); return }
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buf = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        const parts = buf.split('\n\n')
+        buf = parts.pop() ?? ''
+        for (const part of parts) {
+          const lines = part.trim().split('\n')
+          let eventType = '', dataStr = ''
+          for (const l of lines) {
+            if (l.startsWith('event: ')) eventType = l.slice(7).trim()
+            else if (l.startsWith('data: ')) dataStr = l.slice(6).trim()
+          }
+          if (!dataStr) continue
+          try {
+            const d = JSON.parse(dataStr)
+            if (eventType === 'complete' && d.status === 'ok') {
+              setConsolidationResult(d)
+              addToast('success', d.message || 'Files consolidated!')
+            } else if (eventType === 'error') {
+              addToast('error', d.message || 'Consolidation failed.')
+            }
+          } catch (e) { console.error('[consolidate] parse error:', e, 'raw:', dataStr?.slice(0, 100)) }
+        }
+      }
+    } catch { addToast('error', 'Network error during consolidation.') }
+    finally { setConsolidating(false) }
+  }
+
   // ── Card-view helpers ─────────────────────────────────────────────────────
   function acceptColumn(name: string) {
     setColumnStates(prev => ({ ...prev, [name]: 'accepted' }))
@@ -1061,6 +1121,16 @@ function App() {
                         {batchRunning ? '⏳ Processing…' : '🚀 Process All'}
                       </button>
                     )}
+                    {jobFiles.some(f => f.execution_ok) && (
+                      <button
+                        className="btn-success btn-sm"
+                        onClick={handleConsolidate}
+                        disabled={consolidating}
+                        title="Merge all cleaned files into a single unified table"
+                      >
+                        {consolidating ? '⏳ Merging…' : '⬇ Export All'}
+                      </button>
+                    )}
                     <span className="job-id-val">{jobId.slice(0, 10)}…</span>
                   </div>
                 </div>
@@ -1180,6 +1250,93 @@ function App() {
                   )
                 })}
               </section>
+
+              {/* ── Consolidation result panel ── */}
+              {consolidationResult && (
+                <section className="panel consolidation-panel">
+                  <div className="consolidation-header">
+                    <div className="consolidation-title">
+                      <span>🔗 Consolidated Output</span>
+                      <span className="consolidation-badge">
+                        {consolidationResult.consolidated_preview.file_count} files · {consolidationResult.consolidated_preview.row_count} rows · {consolidationResult.consolidated_preview.columns.length} columns
+                      </span>
+                    </div>
+                    <a
+                      href={`${apiBase}/api/v1/jobs/${jobId}/consolidate/download`}
+                      className="btn-success btn-sm"
+                      download
+                    >
+                      ⬇ Download CSV
+                    </a>
+                  </div>
+
+                  {consolidationResult.column_mapping.notes && (
+                    <p className="consolidation-notes">💡 {consolidationResult.column_mapping.notes}</p>
+                  )}
+
+                  {consolidationResult.merge_errors.length > 0 && (
+                    <div className="consolidation-errors">
+                      {consolidationResult.merge_errors.map((e, i) => <div key={i}>⚠ {e}</div>)}
+                    </div>
+                  )}
+
+                  {/* Column mapping table */}
+                  <details className="consolidation-mapping-details">
+                    <summary>📋 Column mapping ({consolidationResult.consolidated_preview.columns.length} unified columns)</summary>
+                    <div className="consolidation-mapping-table-wrap">
+                      <table className="consolidation-mapping-table">
+                        <thead>
+                          <tr>
+                            <th>Canonical column</th>
+                            {Object.values(consolidationResult.column_mapping.file_mappings).length > 0 &&
+                              Object.keys(consolidationResult.column_mapping.file_mappings).map(fid => {
+                                const f = jobFiles.find(jf => jf.id === fid)
+                                return <th key={fid}>{f?.filename ?? fid}</th>
+                              })
+                            }
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {consolidationResult.column_mapping.canonical_columns.map(col => (
+                            <tr key={col}>
+                              <td><code>{col}</code></td>
+                              {Object.entries(consolidationResult.column_mapping.file_mappings).map(([fid, mapping]) => {
+                                const srcCol = Object.entries(mapping).find(([, v]) => v === col)?.[0]
+                                return (
+                                  <td key={fid} className={srcCol ? 'mapping-present' : 'mapping-absent'}>
+                                    {srcCol ? <code>{srcCol}</code> : <span className="mapping-null">—</span>}
+                                  </td>
+                                )
+                              })}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </details>
+
+                  {/* Data preview */}
+                  <div className="consolidation-preview-wrap">
+                    <div className="consolidation-preview-label">Preview (first {consolidationResult.consolidated_preview.sample_rows.length} rows)</div>
+                    <div style={{ overflowX: 'auto' }}>
+                      <table className="consolidation-preview-table">
+                        <thead>
+                          <tr>{consolidationResult.consolidated_preview.columns.map(c => <th key={c}>{c}</th>)}</tr>
+                        </thead>
+                        <tbody>
+                          {consolidationResult.consolidated_preview.sample_rows.map((row, i) => (
+                            <tr key={i}>
+                              {consolidationResult.consolidated_preview.columns.map(c => (
+                                <td key={c}>{row[c] ?? <span className="mapping-null">—</span>}</td>
+                              ))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </section>
+              )}
             </>
           )}
 
