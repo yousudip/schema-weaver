@@ -16,6 +16,7 @@ from typing import Any
 def build_codegen_prompt(
     schema: dict[str, Any],
     preview: dict[str, Any],
+    purpose: str | None = None,
 ) -> str:
     """Build the LLM prompt for Python transformation code generation."""
     columns: list[dict] = schema.get("columns", [])
@@ -27,11 +28,14 @@ def build_codegen_prompt(
     )
 
     file_type: str = preview.get("file_type", "csv")
+    source_note: str = preview.get("source_note", "")
     sample_rows: list = preview.get("sample_rows", [])[:6]
     sample_json: str = json.dumps(sample_rows, indent=2, default=str)
+    purpose_section = f"\n## Business context\n{purpose}\n" if purpose else ""
+    source_note_section = f"\n## Source note\n{source_note}\n" if source_note else ""
 
     return f"""You are a senior Python data engineer specialising in pandas data wrangling.
-
+{purpose_section}{source_note_section}
 ## Task
 Write a self-contained Python script that reads a raw data file, applies the
 column transformations listed below, and writes a clean CSV to disk.
@@ -40,7 +44,7 @@ column transformations listed below, and writes a clean CSV to disk.
 ```python
 input_path   # str — absolute path to the raw source file
 output_path  # str — absolute path where the cleaned CSV must be written
-file_type    # str — one of "csv", "excel", "pdf"
+file_type    # str — one of "csv", "excel"  (PDFs are pre-converted; file_type is NEVER "pdf")
 ```
 
 ## Column mapping
@@ -113,6 +117,7 @@ file_type    # str — one of "csv", "excel", "pdf"
 - Allowed imports only: `pandas`, `numpy`, `re`, `datetime`, `json`, `math`, `pathlib`
 - Do NOT use `exec`, `eval`, `subprocess`, `open` (except via pandas)
 - Handle every step with `try/except` and print a clear error then `raise`
+- Do NOT add any `if file_type == "pdf"` checks — `file_type` is always "csv" or "excel"
 
 ## Output format
 Return ONLY the Python code inside a single ```python ... ``` block.

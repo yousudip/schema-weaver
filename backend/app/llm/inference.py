@@ -28,14 +28,20 @@ class LlmInferenceResult:
     parsed: Dict[str, Any]
 
 
-def build_prompt(preview: Dict[str, Any]) -> str:
+def build_prompt(preview: Dict[str, Any], purpose: str | None = None) -> str:
     sampled_rows, stats_summary = summarize_preview(preview)
     prompt_preview = dict(preview)
     if sampled_rows is not None:
         prompt_preview["sample_rows"] = sampled_rows
     if stats_summary is not None:
         prompt_preview["summary"] = stats_summary
+    purpose_line = (
+        f"Business context: {purpose}\n"
+        "Use this context to guide column name interpretation and type inference.\n\n"
+        if purpose else ""
+    )
     return (
+        f"{purpose_line}"
         "You are a data analyst. Infer a clean schema for the uploaded dataset.\n"
         "Return ONLY valid JSON. No markdown, no explanations.\n"
         "Schema:\n"

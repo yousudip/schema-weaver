@@ -4,6 +4,7 @@
  * Displays the per-column data-quality report produced by the validation loop.
  * Shows fill rates, issues found, and validation attempt history.
  */
+import { useState, useEffect } from 'react'
 import type { ReactElement } from 'react'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -36,11 +37,13 @@ export interface ValidationAttempt {
   run_ok: boolean
   verdict: 'pass' | 'pending' | 'crash' | 'no_output'
   fill_rate?: number
+  code?: string
 }
 
 interface Props {
   report: QualityReportData
   attempts?: ValidationAttempt[]
+  defaultCollapsed?: boolean
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -65,22 +68,62 @@ function pct(rate: number): string {
   return `${Math.round(rate * 100)}%`
 }
 
+// ─── Script viewer modal ──────────────────────────────────────────────────────
+
+function ScriptModal({ attempt, code, onClose }: { attempt: number; code: string; onClose: () => void }): ReactElement {
+  // Close on Escape key
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [onClose])
+
+  const handleCopy = () => navigator.clipboard.writeText(code).catch(() => {})
+
+  return (
+    <div className="script-modal-overlay" onClick={onClose}>
+      <div className="script-modal" onClick={e => e.stopPropagation()}>
+        <div className="script-modal-header">
+          <span className="script-modal-title">📄 Script — Attempt {attempt}</span>
+          <div className="script-modal-actions">
+            <button className="script-modal-btn" onClick={handleCopy} title="Copy to clipboard">⎘ Copy</button>
+            <button className="script-modal-close" onClick={onClose} title="Close (Esc)">✕</button>
+          </div>
+        </div>
+        <pre className="script-modal-code"><code>{code}</code></pre>
+      </div>
+    </div>
+  )
+}
+
 // ─── Attempt badge ────────────────────────────────────────────────────────────
 
-function AttemptBadge({ a }: { a: ValidationAttempt }): ReactElement {
+function AttemptBadge({ a, onViewScript }: { a: ValidationAttempt; onViewScript?: (a: ValidationAttempt) => void }): ReactElement {
   const icon = a.verdict === 'pass' ? '✅' : a.verdict === 'crash' ? '💥' : a.run_ok ? '🔄' : '❌'
   const label = a.verdict === 'pass' ? 'Passed' : a.verdict === 'crash' ? 'Crashed' : a.run_ok ? `${pct(a.fill_rate ?? 0)} fill` : 'No output'
   return (
     <span className="attempt-badge" data-verdict={a.verdict}>
       {icon} Attempt {a.attempt}: {label}
+      {a.code && onViewScript && (
+        <button
+          className="attempt-view-script-btn"
+          onClick={e => { e.stopPropagation(); onViewScript(a) }}
+          title="View the Python script that ran for this attempt"
+        >
+          📄
+        </button>
+      )}
     </span>
   )
 }
 
 // ─── Main component ────────────────────────────────────────────────────────────
 
-export function QualityReport({ report, attempts }: Props): ReactElement {
+export function QualityReport({ report, attempts, defaultCollapsed = false }: Props): ReactElement {
+  const [collapsed, setCollapsed] = useState(defaultCollapsed)
+  const [scriptModal, setScriptModal] = useState<ValidationAttempt | null>(null)
   if (report.read_error) {
+
     return (
       <div className="quality-report quality-report-error">
         <span>⚠ Could not read output CSV: {report.read_error}</span>
@@ -93,15 +136,24 @@ export function QualityReport({ report, attempts }: Props): ReactElement {
   const failCols   = report.columns.filter(c => c.fill_rate < 0.6 || !c.present).length
 
   return (
+    <>
+    {scriptModal && scriptModal.code && (
+      <ScriptModal
+        attempt={scriptModal.attempt}
+        code={scriptModal.code}
+        onClose={() => setScriptModal(null)}
+      />
+    )}
     <div className="quality-report">
       {/* ── Header ── */}
-      <div className="quality-header">
+      <div className="quality-header" style={{ cursor: 'pointer' }} onClick={() => setCollapsed(v => !v)}>
         <div className="quality-title">
           <span className="quality-icon">{report.pass ? '✅' : '⚠️'}</span>
           <span>Data Quality Report</span>
           <span className={`quality-badge ${report.pass ? 'quality-badge-pass' : 'quality-badge-fail'}`}>
             {report.pass ? 'PASSED' : 'ISSUES FOUND'}
           </span>
+          <span className="quality-collapse-toggle">{collapsed ? '▸ Show details' : '▾ Hide details'}</span>
         </div>
 
         {/* Summary pills */}
@@ -120,13 +172,15 @@ export function QualityReport({ report, attempts }: Props): ReactElement {
         {attempts && attempts.length > 0 && (
           <div className="quality-attempts">
             <span className="quality-attempts-label">Validation loop:</span>
-            {attempts.map(a => <AttemptBadge key={a.attempt} a={a} />)}
+            {attempts.map(a => (
+              <AttemptBadge key={a.attempt} a={a} onViewScript={setScriptModal} />
+            ))}
           </div>
         )}
       </div>
 
-      {/* ── Column table ── */}
-      <div className="quality-table-wrap">
+      {/* ── Column table (collapsible) ── */}
+      {!collapsed && <div className="quality-table-wrap">
         <table className="quality-table">
           <thead>
             <tr>
@@ -189,7 +243,8 @@ export function QualityReport({ report, attempts }: Props): ReactElement {
             })}
           </tbody>
         </table>
-      </div>
+      </div>}
     </div>
+    </>
   )
 }

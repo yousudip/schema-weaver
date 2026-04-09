@@ -8,6 +8,7 @@ from backend.app.api.routes.health import router as health_router
 from backend.app.api.routes.jobs import router as jobs_router
 from backend.app.api.routes.stream import router as stream_router
 from backend.app.api.routes.tasks import router as tasks_router
+from backend.app.api.routes.file_pipeline import router as file_pipeline_router
 from backend.app.core.config import get_settings
 from backend.app.core.llm_client import create_azure_openai_client
 from sqlalchemy import select, text
@@ -46,6 +47,7 @@ app.include_router(health_router, tags=["health"])
 app.include_router(jobs_router, tags=["jobs"])
 app.include_router(stream_router, tags=["stream"])
 app.include_router(tasks_router, tags=["tasks"])
+app.include_router(file_pipeline_router, tags=["file_pipeline"])
 
 
 def _task_status_updater(session_factory, task: Task) -> None:
@@ -138,12 +140,22 @@ async def startup() -> None:
             )
     # Create tables individually so a missing pgvector extension
     # doesn't block the jobs/tasks tables from being created.
-    from backend.app.db_models import Job, Task as TaskModel, SchemaVector
-    for table in [Job.__table__, TaskModel.__table__]:
+    from backend.app.db_models import Job, Task as TaskModel, SchemaVector, JobFile
+    for table in [Job.__table__, TaskModel.__table__, JobFile.__table__]:
         try:
             table.create(engine, checkfirst=True)
         except Exception as tbl_err:
             logging.getLogger(__name__).error("Failed to create table %s: %s", table.name, tbl_err)
+    # Add new columns to existing jobs table if upgrading from older schema
+    with engine.begin() as conn:
+        for col_def in [
+            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS purpose VARCHAR",
+            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS description TEXT",
+        ]:
+            try:
+                conn.execute(text(col_def))
+            except Exception:
+                pass  # column already exists or unsupported syntax — safe to ignore
     try:
         SchemaVector.__table__.create(engine, checkfirst=True)
     except Exception:

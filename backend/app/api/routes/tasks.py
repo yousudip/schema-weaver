@@ -99,6 +99,8 @@ async def get_job(request: Request, job_id: str) -> Dict[str, Any]:
         {
             "job_id": job.id,
             "filename": job.filename,
+            "purpose": job.purpose,
+            "description": job.description,
             "storage_path": job.storage_path,
             "status": job.status,
             "task_status": job.task_status,

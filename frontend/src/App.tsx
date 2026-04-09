@@ -26,9 +26,26 @@ interface SchemaInference {
 interface Job {
   job_id: string
   filename: string
+  purpose?: string
   status: string
   task_status: string | null
+  file_count?: number
   created_at: string | null
+}
+
+interface JobFileEntry {
+  file_id: string
+  filename: string
+  file_type: string | null
+  status: string
+  error: string | null
+  has_preview: boolean
+  has_schema: boolean
+  has_code: boolean
+  quality_report: QualityReportData | null
+  validation_attempts: ValidationAttempt[]
+  created_at: string | null
+  needs_extraction?: boolean
 }
 
 
@@ -167,6 +184,25 @@ function App() {
   const [showRawResult, setShowRawResult] = useState(false)
   const [showApiConfig, setShowApiConfig] = useState(false)
 
+  // ── Phase 5: multi-file job state ─────────────────────────────────────────
+  const [jobLoading, setJobLoading] = useState(false)
+  const [showNewJobModal, setShowNewJobModal] = useState(false)
+  const [newJobPurpose, setNewJobPurpose] = useState('')
+  const [newJobDesc, setNewJobDesc] = useState('')
+  const [newJobCreating, setNewJobCreating] = useState(false)
+  const [activeJobPurpose, setActiveJobPurpose] = useState<string | null>(null)
+  const [jobFiles, setJobFiles] = useState<JobFileEntry[]>([])
+  const [jobFilesLoading, setJobFilesLoading] = useState(false)
+  // Per-file pipeline progress keyed by file_id
+  const [fileProgress, setFileProgress] = useState<Record<string, string[]>>({})
+  const [fileStatus, setFileStatus] = useState<Record<string, AsyncStatus>>({})
+  const [fileExtractStatus, setFileExtractStatus] = useState<Record<string, AsyncStatus>>({})
+  const [fileUploadStatus, setFileUploadStatus] = useState<AsyncStatus>('idle')
+  const [fileUploadInput, setFileUploadInput] = useState<File | null>(null)
+  // Batch processing
+  const [showBatchModal, setShowBatchModal] = useState(false)
+  const [batchRunning, setBatchRunning] = useState(false)
+
   // ── Toast helpers ──────────────────────────────────────────────────────────
   const addToast = useCallback((type: ToastType, message: string) => {
     const id = `${Date.now()}-${Math.random()}`
@@ -272,12 +308,17 @@ function App() {
     setStatus(job.status || 'unknown')
     setTaskStatus(job.task_status || null)
     setStep(job.step || null)
-    setResult(job.result || null)
-    setAnalysis(job.analysis || null)
     setError(job.error || null)
 
-    // Restore derived statuses from persisted analysis so loaded jobs
-    // resume at the correct wizard step without re-running each stage
+    // Multi-file job — don't restore wizard state, just keep multi-file view active
+    if (job.purpose) {
+      setActiveJobPurpose(job.purpose)
+      return
+    }
+
+    // Legacy single-file job — restore wizard state
+    setResult(job.result || null)
+    setAnalysis(job.analysis || null)
     const analysis = job.analysis || {}
     if (analysis.schema_inference || analysis.selected_schema) {
       setInferenceStatus('ok')
@@ -468,12 +509,18 @@ function App() {
 
   async function handleSelectJob(id: string) {
     // Reset all derived state first
+    setJobLoading(true)
     setJobId(id)
+    setStatus('idle')
     setAnalysis(null)
     setInferenceStatus('idle'); setEmbeddingStatus('idle')
     setMappings([]); setColumnStates({})
+    setActiveJobPurpose(null); setJobFiles([])
+    setFileProgress({}); setFileStatus({})
     resetAll()
-    // Then load job data and restore statuses from persisted analysis
+
+    try {
+    // Load job data
     const res = await fetch(`${apiBase}/api/v1/jobs/${id}`)
     if (!res.ok) return
     const data = await res.json()
@@ -482,10 +529,19 @@ function App() {
     setStatus(job.status || 'unknown')
     setTaskStatus(job.task_status || null)
     setStep(job.step || null)
-    setResult(job.result || null)
-    setAnalysis(job.analysis || null)
     setError(job.error || null)
 
+    // Multi-file job (has purpose, no single file)
+    if (job.purpose) {
+      setActiveJobPurpose(job.purpose)
+      setResult(null); setAnalysis(null)
+      fetchJobFiles(id)
+      return
+    }
+
+    // Legacy single-file job — restore wizard state from persisted analysis
+    setResult(job.result || null)
+    setAnalysis(job.analysis || null)
     const a = job.analysis || {}
     if (a.schema_inference || a.selected_schema) setInferenceStatus('ok')
     if (a.generated_code) { setGeneratedCode(a.generated_code); setGenerateStatus('ok'); setCodeEdited(false) }
@@ -493,6 +549,9 @@ function App() {
     if (a.execution_log) setSandboxLog(a.execution_log)
     if (a.quality_report) setQualityReport(a.quality_report)
     if (a.validation_attempts) setValidationAttempts(a.validation_attempts)
+    } finally {
+      setJobLoading(false)
+    }
   }
 
   async function handleDeleteJob(id: string) {
@@ -506,6 +565,365 @@ function App() {
     }
     fetchJobs()
     addToast('info', 'Job deleted.')
+  }
+
+  // ── Phase 5: multi-file job handlers ─────────────────────────────────────
+
+  async function handleCreateJob() {
+    if (!newJobPurpose.trim()) return
+    setNewJobCreating(true)
+    try {
+      const res = await fetch(`${apiBase}/api/v1/jobs/new`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ purpose: newJobPurpose.trim(), description: newJobDesc.trim() || null }),
+      })
+      if (!res.ok) { addToast('error', 'Failed to create job.'); return }
+      const data = await res.json()
+      setShowNewJobModal(false)
+      setNewJobPurpose(''); setNewJobDesc('')
+      await fetchJobs()
+      // Select the new job
+      setJobId(data.job_id)
+      setActiveJobPurpose(newJobPurpose.trim())
+      setJobFiles([])
+      setStatus('ready')
+      addToast('success', `Job created: ${data.purpose}`)
+    } catch { addToast('error', 'Network error.') }
+    finally { setNewJobCreating(false) }
+  }
+
+  async function fetchJobFiles(jid: string) {
+    setJobFilesLoading(true)
+    try {
+      const res = await fetch(`${apiBase}/api/v1/jobs/${jid}/files`)
+      if (!res.ok) return
+      const data = await res.json()
+      setJobFiles(data.files || [])
+      // Note: do NOT call setActiveJobPurpose here — purpose is already managed by handleSelectJob
+    } catch { /* network */ }
+    finally { setJobFilesLoading(false) }
+  }
+
+  async function handleAddFileToJob() {
+    if (!fileUploadInput || !jobId) return
+    setFileUploadStatus('running')
+    const form = new FormData()
+    form.append('file', fileUploadInput)
+    try {
+      const res = await fetch(`${apiBase}/api/v1/jobs/${jobId}/files`, { method: 'POST', body: form })
+      if (!res.ok) { setFileUploadStatus('error'); addToast('error', 'File upload failed.'); return }
+      const data = await res.json()
+      setFileUploadStatus('idle')
+      setFileUploadInput(null)
+      addToast('success', `${data.filename} uploaded (${data.file_type}) — ${data.status}`)
+      fetchJobFiles(jobId)
+    } catch { setFileUploadStatus('error'); addToast('error', 'Network error on upload.') }
+  }
+
+  async function handleRemoveJobFile(fileId: string) {
+    if (!jobId) return
+    await fetch(`${apiBase}/api/v1/jobs/${jobId}/files/${fileId}`, { method: 'DELETE' })
+    fetchJobFiles(jobId)
+    addToast('info', 'File removed.')
+  }
+
+  async function handleFileInfer(fileId: string) {
+    if (!jobId) return
+    setFileStatus(p => ({ ...p, [fileId]: 'running' }))
+    try {
+      const res = await fetch(`${apiBase}/api/v1/jobs/${jobId}/files/${fileId}/infer`, { method: 'POST' })
+      const data = await res.json()
+      if (data.status !== 'ok') { setFileStatus(p => ({ ...p, [fileId]: 'error' })); addToast('error', data.message || 'Inference failed.'); return }
+      setFileStatus(p => ({ ...p, [fileId]: 'ok' }))
+      addToast('success', 'Schema inferred!')
+      fetchJobFiles(jobId)
+    } catch { setFileStatus(p => ({ ...p, [fileId]: 'error' })); addToast('error', 'Inference network error.') }
+  }
+
+  async function handleFileSelectSchema(fileId: string) {
+    if (!jobId) return
+    try {
+      const res = await fetch(`${apiBase}/api/v1/jobs/${jobId}/files/${fileId}/schema/select`, { method: 'POST' })
+      const data = await res.json()
+      if (data.status !== 'ok') { addToast('error', data.message || 'Schema confirmation failed.'); return }
+      addToast('success', 'Schema confirmed ✓')
+      fetchJobFiles(jobId)
+    } catch { addToast('error', 'Network error.') }
+  }
+
+  async function handleFileGenerate(fileId: string) {
+    if (!jobId) return
+    setFileStatus(p => ({ ...p, [fileId]: 'running' }))
+    try {
+      const res = await fetch(`${apiBase}/api/v1/jobs/${jobId}/files/${fileId}/generate`, { method: 'POST' })
+      const data = await res.json()
+      if (data.status !== 'ok') { setFileStatus(p => ({ ...p, [fileId]: 'error' })); addToast('error', data.message || 'Code gen failed.'); return }
+      setFileStatus(p => ({ ...p, [fileId]: 'ok' }))
+      addToast('success', 'Script generated!')
+      fetchJobFiles(jobId)
+    } catch { setFileStatus(p => ({ ...p, [fileId]: 'error' })); addToast('error', 'Network error.') }
+  }
+
+  async function handleFileExecute(fileId: string) {
+    if (!jobId) return
+    setFileStatus(p => ({ ...p, [fileId]: 'running' }))
+    setFileProgress(p => ({ ...p, [fileId]: [] }))
+    try {
+      const res = await fetch(`${apiBase}/api/v1/jobs/${jobId}/files/${fileId}/execute/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      })
+      if (!res.ok || !res.body) { setFileStatus(p => ({ ...p, [fileId]: 'error' })); addToast('error', 'Execution request failed.'); return }
+
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const parts = buffer.split('\n\n')
+        buffer = parts.pop() ?? ''
+        for (const part of parts) {
+          let eventType = 'message'; let dataLine = ''
+          for (const line of part.split('\n')) {
+            if (line.startsWith('event: ')) eventType = line.slice(7).trim()
+            if (line.startsWith('data: ')) dataLine = line.slice(6).trim()
+          }
+          if (!dataLine) continue
+          try {
+            const d = JSON.parse(dataLine)
+            if (eventType === 'attempt_start') {
+              setFileProgress(p => ({ ...p, [fileId]: [...(p[fileId] || []), `🔄 Attempt ${d.attempt}/${d.total}...`] }))
+            } else if (eventType === 'attempt_result') {
+              const fillPct = Math.round((d.fill_rate ?? 0) * 100)
+              setFileProgress(p => ({ ...p, [fileId]: [...(p[fileId] || []), `${d.pass ? '✅' : '⚠️'} Attempt ${d.attempt}: ${fillPct}% fill`] }))
+            } else if (eventType === 'attempt_crash') {
+              setFileProgress(p => ({ ...p, [fileId]: [...(p[fileId] || []), `💥 Attempt ${d.attempt}: crashed`] }))
+            } else if (eventType === 'llm_fixing') {
+              setFileProgress(p => ({ ...p, [fileId]: [...(p[fileId] || []), `🤖 LLM rewriting script...`] }))
+            } else if (eventType === 'complete') {
+              setFileStatus(p => ({ ...p, [fileId]: d.status === 'ok' ? 'ok' : 'error' }))
+              if (d.status === 'ok') addToast('success', `File cleaned successfully!`)
+              else addToast('error', 'Execution failed — check logs.')
+              fetchJobFiles(jobId)
+            } else if (eventType === 'error') {
+              setFileStatus(p => ({ ...p, [fileId]: 'error' }))
+              addToast('error', `Error: ${d.message}`)
+            }
+          } catch { /* ignore */ }
+        }
+      }
+    } catch { setFileStatus(p => ({ ...p, [fileId]: 'error' })); addToast('error', 'Network error.') }
+  }
+
+  // ── Shared: run full infer→select→generate→execute pipeline for one file ────
+  async function runFilePipeline(fid: string, jid: string) {
+    // Step 1: Infer
+    setFileProgress(p => ({ ...p, [fid]: [...(p[fid] || []), '🧠 Inferring schema…'] }))
+    setFileStatus(p => ({ ...p, [fid]: 'running' }))
+    const ir = await fetch(`${apiBase}/api/v1/jobs/${jid}/files/${fid}/infer`, { method: 'POST' })
+    const id = await ir.json()
+    if (id.status !== 'ok') {
+      setFileProgress(p => ({ ...p, [fid]: [...(p[fid] || []), `❌ Infer failed: ${id.message}`] }))
+      setFileStatus(p => ({ ...p, [fid]: 'error' }))
+      return false
+    }
+    setFileProgress(p => ({ ...p, [fid]: [...(p[fid] || []), '✅ Schema inferred'] }))
+
+    // Step 2: Auto-confirm schema
+    await fetch(`${apiBase}/api/v1/jobs/${jid}/files/${fid}/schema/select`, { method: 'POST' })
+
+    // Step 3: Generate
+    setFileProgress(p => ({ ...p, [fid]: [...(p[fid] || []), '⚗️ Generating cleaning script…'] }))
+    const gr = await fetch(`${apiBase}/api/v1/jobs/${jid}/files/${fid}/generate`, { method: 'POST' })
+    const gd = await gr.json()
+    if (gd.status !== 'ok') {
+      setFileProgress(p => ({ ...p, [fid]: [...(p[fid] || []), `❌ Generate failed: ${gd.message}`] }))
+      setFileStatus(p => ({ ...p, [fid]: 'error' }))
+      return false
+    }
+    setFileProgress(p => ({ ...p, [fid]: [...(p[fid] || []), '✅ Script generated'] }))
+
+    // Step 4: Execute (SSE)
+    setFileProgress(p => ({ ...p, [fid]: [...(p[fid] || []), '▶ Executing in sandbox…'] }))
+    setFileStatus(p => ({ ...p, [fid]: 'running' }))
+    const er = await fetch(`${apiBase}/api/v1/jobs/${jid}/files/${fid}/execute/stream`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    })
+    if (!er.ok || !er.body) { setFileStatus(p => ({ ...p, [fid]: 'error' })); return false }
+    const reader = er.body.getReader(); const decoder = new TextDecoder(); let buf = ''
+    while (true) {
+      const { done, value } = await reader.read(); if (done) break
+      buf += decoder.decode(value, { stream: true })
+      const parts = buf.split('\n\n'); buf = parts.pop() ?? ''
+      for (const part of parts) {
+        let eventType = 'message'; let dataLine = ''
+        for (const line of part.split('\n')) {
+          if (line.startsWith('event: ')) eventType = line.slice(7).trim()
+          if (line.startsWith('data: ')) dataLine = line.slice(6).trim()
+        }
+        if (!dataLine) continue
+        try {
+          const d = JSON.parse(dataLine)
+          if (eventType === 'attempt_start') {
+            setFileProgress(p => ({ ...p, [fid]: [...(p[fid] || []), `🔄 Attempt ${d.attempt}/${d.total}…`] }))
+          } else if (eventType === 'attempt_result') {
+            const pct = Math.round((d.fill_rate ?? 0) * 100)
+            setFileProgress(p => ({ ...p, [fid]: [...(p[fid] || []), `${d.pass ? '✅' : '⚠️'} Attempt ${d.attempt}: ${pct}% fill`] }))
+          } else if (eventType === 'attempt_crash') {
+            setFileProgress(p => ({ ...p, [fid]: [...(p[fid] || []), `💥 Attempt ${d.attempt}: crashed — self-healing…`] }))
+          } else if (eventType === 'complete') {
+            setFileStatus(p => ({ ...p, [fid]: d.status === 'ok' ? 'ok' : 'error' }))
+            fetchJobFiles(jid)
+            return d.status === 'ok'
+          } else if (eventType === 'error') {
+            setFileStatus(p => ({ ...p, [fid]: 'error' }))
+            return false
+          }
+        } catch { /* ignore */ }
+      }
+    }
+    return false
+  }
+
+  // ── PDF extract & tabularize → then auto-run full pipeline ──────────────────
+  async function handleFileExtract(fileId: string) {
+    if (!jobId) return
+    setFileExtractStatus(p => ({ ...p, [fileId]: 'running' }))
+    setFileProgress(p => ({ ...p, [fileId]: [] }))
+    try {
+      const res = await fetch(`${apiBase}/api/v1/jobs/${jobId}/files/${fileId}/extract/stream`, { method: 'POST' })
+      if (!res.ok || !res.body) {
+        setFileExtractStatus(p => ({ ...p, [fileId]: 'error' }))
+        addToast('error', 'Extract request failed.')
+        return
+      }
+
+      let extractOk = false
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const parts = buffer.split('\n\n')
+        buffer = parts.pop() ?? ''
+        for (const part of parts) {
+          let eventType = 'message'; let dataLine = ''
+          for (const line of part.split('\n')) {
+            if (line.startsWith('event: ')) eventType = line.slice(7).trim()
+            if (line.startsWith('data: ')) dataLine = line.slice(6).trim()
+          }
+          if (!dataLine) continue
+          try {
+            const d = JSON.parse(dataLine)
+            if (eventType === 'detecting') {
+              setFileProgress(p => ({ ...p, [fileId]: [...(p[fileId] || []), '🔍 Detecting PDF type…'] }))
+            } else if (eventType === 'extracting') {
+              const label = d.method === 'image' ? '🖼 Running vision OCR…' : '📄 Extracting text…'
+              setFileProgress(p => ({ ...p, [fileId]: [...(p[fileId] || []), label] }))
+            } else if (eventType === 'tabularizing') {
+              setFileProgress(p => ({ ...p, [fileId]: [...(p[fileId] || []), '🤖 LLM tabularizing data…'] }))
+            } else if (eventType === 'complete') {
+              extractOk = true
+              setFileExtractStatus(p => ({ ...p, [fileId]: 'ok' }))
+              setFileProgress(p => ({ ...p, [fileId]: [...(p[fileId] || []), '✅ Extraction complete — running pipeline…'] }))
+            } else if (eventType === 'error') {
+              setFileExtractStatus(p => ({ ...p, [fileId]: 'error' }))
+              addToast('error', `Extraction error: ${d.message}`)
+            }
+          } catch { /* ignore */ }
+        }
+      }
+
+      if (extractOk) {
+        const ok = await runFilePipeline(fileId, jobId)
+        if (ok) addToast('success', 'PDF fully processed!')
+        else addToast('error', 'PDF extracted but pipeline failed — check progress.')
+        fetchJobFiles(jobId)
+      }
+    } catch { setFileExtractStatus(p => ({ ...p, [fileId]: 'error' })); addToast('error', 'Network error during extraction.') }
+  }
+
+  // ── Batch: run full pipeline on all eligible files ────────────────────────
+  async function handleBatchProcess() {
+    if (!jobId) return
+    setShowBatchModal(false)
+    setBatchRunning(true)
+    addToast('info', 'Batch processing started…')
+
+    // Include PDFs that have been extracted (has_preview) or need extraction first
+    const eligible = jobFiles.filter(f =>
+      (f.has_preview && f.file_type !== 'pdf') ||
+      (f.file_type === 'pdf' && (f.has_preview || f.needs_extraction))
+    )
+    for (const f of eligible) {
+      const fid = f.file_id
+      try {
+        // For PDFs that still need extraction: run extract/stream first
+        if (f.file_type === 'pdf' && f.needs_extraction) {
+          setFileProgress(p => ({ ...p, [fid]: [...(p[fid] || []), '🔍 Extracting PDF…'] }))
+          setFileExtractStatus(p => ({ ...p, [fid]: 'running' }))
+          const extractRes = await fetch(`${apiBase}/api/v1/jobs/${jobId}/files/${fid}/extract/stream`, { method: 'POST' })
+          if (!extractRes.ok || !extractRes.body) {
+            setFileExtractStatus(p => ({ ...p, [fid]: 'error' }))
+            addToast('error', `Could not extract ${f.filename}`)
+            continue
+          }
+          let extractOk = false
+          const extractReader = extractRes.body.getReader(); const extractDecoder = new TextDecoder(); let extractBuf = ''
+          while (true) {
+            const { done, value } = await extractReader.read(); if (done) break
+            extractBuf += extractDecoder.decode(value, { stream: true })
+            const parts = extractBuf.split('\n\n'); extractBuf = parts.pop() ?? ''
+            for (const part of parts) {
+              let eventType = 'message'; let dataLine = ''
+              for (const line of part.split('\n')) {
+                if (line.startsWith('event: ')) eventType = line.slice(7).trim()
+                if (line.startsWith('data: ')) dataLine = line.slice(6).trim()
+              }
+              if (!dataLine) continue
+              try {
+                const d = JSON.parse(dataLine)
+                if (eventType === 'detecting') {
+                  setFileProgress(p => ({ ...p, [fid]: [...(p[fid] || []), '🔍 Detecting PDF type…'] }))
+                } else if (eventType === 'extracting') {
+                  const label = d.method === 'image' ? '🖼 Running vision OCR…' : '📄 Extracting text…'
+                  setFileProgress(p => ({ ...p, [fid]: [...(p[fid] || []), label] }))
+                } else if (eventType === 'tabularizing') {
+                  setFileProgress(p => ({ ...p, [fid]: [...(p[fid] || []), '🤖 LLM tabularizing data…'] }))
+                } else if (eventType === 'complete') {
+                  extractOk = true
+                  setFileExtractStatus(p => ({ ...p, [fid]: 'ok' }))
+                  setFileProgress(p => ({ ...p, [fid]: [...(p[fid] || []), '✅ PDF extracted'] }))
+                } else if (eventType === 'error') {
+                  setFileExtractStatus(p => ({ ...p, [fid]: 'error' }))
+                  setFileProgress(p => ({ ...p, [fid]: [...(p[fid] || []), `❌ Extraction failed: ${d.message}`] }))
+                }
+              } catch { /* ignore */ }
+            }
+          }
+          if (!extractOk) continue
+        }
+
+        // Run full infer → select → generate → execute pipeline
+        const ok = await runFilePipeline(fid, jobId)
+        if (ok) addToast('success', `✅ ${f.filename} cleaned!`)
+        else addToast('error', `❌ ${f.filename} failed.`)
+
+      } catch (err) {
+        setFileStatus(p => ({ ...p, [fid]: 'error' }))
+        addToast('error', `Error processing ${f.filename}`)
+      }
+    }
+
+    setBatchRunning(false)
+    addToast('success', 'Batch processing complete!')
+    fetchJobFiles(jobId)
   }
 
   // ── Card-view helpers ─────────────────────────────────────────────────────
@@ -553,31 +971,36 @@ function App() {
         </section>
       )}
 
-      {/* ── Step Wizard ── */}
-      <section className="panel step-wizard-panel">
-        <div className="step-wizard">
-          {STEPS.map((s, i) => {
-            const done = s.id < currentStep
-            const active = s.id === currentStep
-            return (
-              <div key={s.id} className={`step ${done ? 'step-done' : active ? 'step-active' : 'step-pending'}`}>
-                <div className="step-icon-wrap">
-                  <div className="step-icon">{done ? '✅' : s.icon}</div>
+      {/* ── Step Wizard — hidden for multi-file jobs (they have their own panel) ── */}
+      {!activeJobPurpose && !jobLoading && (
+        <section className="panel step-wizard-panel">
+          <div className="step-wizard">
+            {STEPS.map((s, i) => {
+              const done = s.id < currentStep
+              const active = s.id === currentStep
+              return (
+                <div key={s.id} className={`step ${done ? 'step-done' : active ? 'step-active' : 'step-pending'}`}>
+                  <div className="step-icon-wrap">
+                    <div className="step-icon">{done ? '✅' : s.icon}</div>
+                  </div>
+                  <div className="step-label">{s.label}</div>
+                  {i < STEPS.length - 1 && <div className={`step-line ${done ? 'step-line-done' : ''}`} />}
                 </div>
-                <div className="step-label">{s.label}</div>
-                {i < STEPS.length - 1 && <div className={`step-line ${done ? 'step-line-done' : ''}`} />}
-              </div>
-            )
-          })}
-        </div>
-      </section>
+              )
+            })}
+          </div>
+        </section>
+      )}
 
       <div className="main-layout">
         {/* ── Left: Recent Jobs ── */}
         <aside className="panel jobs-panel">
           <div className="panel-header">
             <div className="label">Recent Jobs</div>
-            <button className="btn-ghost btn-sm" onClick={fetchJobs}>↻ Reload</button>
+            <div style={{ display: 'flex', gap: 4 }}>
+              <button className="btn-primary btn-sm" onClick={() => setShowNewJobModal(true)}>+ New</button>
+              <button className="btn-ghost btn-sm" onClick={fetchJobs}>↻</button>
+            </div>
           </div>
           <ul className="jobs">
             {jobs.length === 0 && <li className="no-jobs">No jobs yet.</li>}
@@ -585,10 +1008,17 @@ function App() {
               <li key={job.job_id}>
                 <div className={`job ${jobId === job.job_id ? 'job-active' : ''}`}>
                   <button className="job-main" onClick={() => handleSelectJob(job.job_id)}>
-                    <div className="job-title">{job.filename}</div>
+                    <div className="job-title">
+                      {job.purpose
+                        ? <><span className="job-purpose-badge">📋</span> {job.purpose}</>
+                        : job.filename}
+                    </div>
                     <div className="job-meta">
                       <span className={`status-dot status-${job.status}`} />
                       {job.status}
+                      {job.file_count != null && job.file_count > 0 && (
+                        <span className="job-file-count">{job.file_count} file{job.file_count !== 1 ? 's' : ''}</span>
+                      )}
                     </div>
                   </button>
                   <button className="btn-danger btn-sm" onClick={() => handleDeleteJob(job.job_id)}>✕</button>
@@ -601,8 +1031,160 @@ function App() {
         {/* ── Right: Main content ── */}
         <div className="content-col">
 
-          {/* ── Step 1 & 2: Upload + Parse ── */}
-          {currentStep <= 2 && (
+          {/* ── Loading state while switching jobs ── */}
+          {jobLoading && (
+            <section className="panel" style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-muted)' }}>
+              Loading job…
+            </section>
+          )}
+
+          {/* ── Multi-file job view (Phase 5) ── */}
+          {!jobLoading && activeJobPurpose && (
+            <>
+              <section className="panel">
+                <div className="panel-title" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div>
+                    <span className="step-badge">Job</span>
+                    {activeJobPurpose}
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    {jobFiles.some(f =>
+                      (f.has_preview && f.file_type !== 'pdf') ||
+                      (f.file_type === 'pdf' && (f.has_preview || f.needs_extraction))
+                    ) && (
+                      <button
+                        className="btn-primary btn-sm"
+                        onClick={() => setShowBatchModal(true)}
+                        disabled={batchRunning}
+                        title="Automatically run Infer → Generate → Execute on all eligible files"
+                      >
+                        {batchRunning ? '⏳ Processing…' : '🚀 Process All'}
+                      </button>
+                    )}
+                    <span className="job-id-val">{jobId.slice(0, 10)}…</span>
+                  </div>
+                </div>
+
+                {/* File upload strip */}
+                <div className="mf-upload-row">
+                  <input
+                    type="file"
+                    id="mf-file-input"
+                    accept=".csv,.xlsx,.xls,.pdf,.jpg,.jpeg,.png"
+                    onChange={e => setFileUploadInput(e.target.files?.[0] || null)}
+                    style={{ display: 'none' }}
+                  />
+                  <label htmlFor="mf-file-input" className="mf-file-label">
+                    {fileUploadInput ? `📄 ${fileUploadInput.name}` : '📁 Choose file to add…'}
+                  </label>
+                  <button
+                    className="btn-primary btn-sm"
+                    onClick={handleAddFileToJob}
+                    disabled={!fileUploadInput || fileUploadStatus === 'running'}
+                  >
+                    {fileUploadStatus === 'running' ? '⏳ Uploading…' : '+ Add File'}
+                  </button>
+                </div>
+
+                {/* File list */}
+                {jobFilesLoading && <div className="progress-banner"><div className="progress-bar-indeterminate" /></div>}
+                {jobFiles.length === 0 && !jobFilesLoading && (
+                  <div className="mf-empty">No files yet — add your first file above.</div>
+                )}
+                {jobFiles.map(f => {
+                  const fst = fileStatus[f.file_id] ?? 'idle'
+                  const fest = fileExtractStatus[f.file_id] ?? 'idle'
+                  const progress = fileProgress[f.file_id] ?? []
+                  const qr = f.quality_report
+                  const fillPct = qr ? Math.round(qr.overall_fill_rate * 100) : null
+                  const statusLabel: Record<string, string> = {
+                    pending: 'pending', ready: 'ready', inferring: 'inferring',
+                    generating: 'generating', executing: 'executing',
+                    validated: 'validated', failed: 'failed',
+                  }
+                  return (
+                    <div key={f.file_id} className={`mf-file-card mf-file-${f.status}`}>
+                      <div className="mf-file-top">
+                        <div className="mf-file-info">
+                          <span className="mf-file-type-badge">{f.file_type ?? '?'}</span>
+                          <span className="mf-file-name">{f.filename}</span>
+                          <span className={`mf-file-status mf-status-${f.status}`}>{statusLabel[f.status] ?? f.status}</span>
+                          {fillPct !== null && (
+                            <span className={`mf-fill-badge ${fillPct >= 90 ? 'fill-good' : fillPct >= 70 ? 'fill-warn' : 'fill-bad'}`}>
+                              {fillPct}% fill
+                            </span>
+                          )}
+                        </div>
+                        <div className="mf-file-actions">
+                          {f.has_preview && !f.has_schema && (
+                            <button className="btn-sm btn-secondary" onClick={() => handleFileInfer(f.file_id)} disabled={fst === 'running'}>
+                              🧠 Infer
+                            </button>
+                          )}
+                          {f.has_schema && (
+                            <button className="btn-sm btn-ghost" onClick={() => handleFileSelectSchema(f.file_id)}>
+                              💾 Confirm
+                            </button>
+                          )}
+                          {f.has_schema && !f.has_code && (
+                            <button className="btn-sm btn-secondary" onClick={() => handleFileGenerate(f.file_id)} disabled={fst === 'running'}>
+                              ⚗️ Generate
+                            </button>
+                          )}
+                          {f.has_code && (
+                            <button className="btn-sm btn-primary" onClick={() => handleFileExecute(f.file_id)} disabled={fst === 'running'}>
+                              {fst === 'running' ? '⏳ Running…' : '▶ Execute'}
+                            </button>
+                          )}
+                          {f.status === 'validated' && (
+                            <a
+                              href={`${apiBase}/api/v1/jobs/${jobId}/files/${f.file_id}/download`}
+                              className="btn-sm btn-primary"
+                              download
+                            >⬇ Download</a>
+                          )}
+                          <button className="btn-sm btn-danger" onClick={() => handleRemoveJobFile(f.file_id)}>✕</button>
+                        </div>
+                      </div>
+
+                      {f.error && <div className="mf-file-error">⚠ {f.error}</div>}
+
+                      {/* PDF: needs extraction */}
+                      {f.file_type === 'pdf' && f.needs_extraction && (
+                        <div className="mf-file-info-note">
+                          📄 This PDF needs to be extracted before it can be processed.
+                          AI will detect whether it is text-based or image-based and tabularize the content.
+                          <button
+                            className="btn-sm btn-extract"
+                            onClick={() => handleFileExtract(f.file_id)}
+                            disabled={fest === 'running'}
+                          >
+                            {fest === 'running' ? '⏳ Extracting…' : '🔍 Extract & Tabularize'}
+                          </button>
+                        </div>
+                      )}
+
+                      {/* Live progress for this file */}
+                      {progress.length > 0 && (
+                        <div className="execute-progress-live" style={{ marginTop: '0.5rem' }}>
+                          {progress.map((line, i) => <div key={i} className="execute-progress-line">{line}</div>)}
+                          {fst === 'running' && <div className="execute-progress-line execute-progress-dots">⏳ working…</div>}
+                        </div>
+                      )}
+
+                      {/* Quality report inline — collapsed by default to keep cards compact */}
+                      {qr && f.validation_attempts.length > 0 && (
+                        <QualityReport report={qr} attempts={f.validation_attempts} defaultCollapsed={true} />
+                      )}
+                    </div>
+                  )
+                })}
+              </section>
+            </>
+          )}
+
+          {/* ── Step 1 & 2: Upload + Parse (single-file legacy mode) ── */}
+          {!jobLoading && !activeJobPurpose && currentStep <= 2 && (
             <section className="panel">
               <div className="panel-title">
                 <span className="step-badge">Step 1</span>
@@ -645,7 +1227,7 @@ function App() {
           )}
 
           {/* ── Step 3: AI Inference ── */}
-          {currentStep === 3 && (
+          {!jobLoading && !activeJobPurpose && currentStep === 3 && (
             <section className="panel">
               <div className="panel-title">
                 <span className="step-badge">Step 2</span>
@@ -678,7 +1260,7 @@ function App() {
           )}
 
           {/* ── Step 4: Schema Review — Card or Map view ── */}
-          {currentStep === 4 && columns.length > 0 && (
+          {!jobLoading && !activeJobPurpose && currentStep === 4 && columns.length > 0 && (
             <section className={`panel ${reviewMode === 'map' ? 'panel-mapper' : ''}`}>
 
               {/* Title + view toggle */}
@@ -826,7 +1408,7 @@ function App() {
           )}
 
           {/* ── Step 5: Transform — code gen + sandbox execution ── */}
-          {currentStep >= 4 && currentStep < 6 && inferenceStatus === 'ok' && (
+          {!jobLoading && !activeJobPurpose && currentStep >= 4 && currentStep < 6 && inferenceStatus === 'ok' && (
             <section className="panel">
               <div className="panel-title">
                 <span className="step-badge">Step 4</span>
@@ -956,7 +1538,7 @@ function App() {
           )}
 
           {/* ── Step 6: Done ── */}
-          {currentStep === 6 && (
+          {!jobLoading && !activeJobPurpose && currentStep === 6 && (
             <section className="panel">
               <div className="panel-title">
                 <span className="step-badge step-badge-done">Done</span>
@@ -1020,8 +1602,8 @@ function App() {
             </section>
           )}
 
-          {/* ── Job Status Row (always visible when job active) ── */}
-          {jobId && (
+          {/* ── Job Status Row (single-file mode only) ── */}
+          {!jobLoading && !activeJobPurpose && jobId && (
             <section className="panel panel-status">
               <div className="status-grid">
                 <div>
@@ -1075,6 +1657,88 @@ function App() {
 
         </div>
       </div>
+      {/* ── Batch Process Modal ── */}
+      {showBatchModal && (
+        <div className="modal-overlay" onClick={() => setShowBatchModal(false)}>
+          <div className="modal-box" onClick={e => e.stopPropagation()}>
+            <div className="modal-title">🚀 Batch Process All Files</div>
+            <div className="batch-modal-info">
+              <div className="batch-modal-warning">
+                <span className="batch-warning-icon">⚠️</span>
+                <div>
+                  <strong>Auto-pilot mode</strong> — AI will make all decisions automatically.
+                  Schema mappings, column selections, and cleaning strategies will be chosen
+                  without manual confirmation. You can review and re-run individual files
+                  afterwards.
+                </div>
+              </div>
+              <div className="batch-modal-steps">
+                <div className="batch-step">🔍 <strong>Extract</strong> — PDFs are detected (text/image) and tabularized via AI</div>
+                <div className="batch-step">🧠 <strong>Infer</strong> — AI analyses each file's structure</div>
+                <div className="batch-step">✅ <strong>Auto-confirm</strong> — Best schema selected automatically</div>
+                <div className="batch-step">⚗️ <strong>Generate</strong> — Cleaning script written per file</div>
+                <div className="batch-step">▶ <strong>Execute</strong> — Script runs in sandbox with self-healing</div>
+              </div>
+              <div className="batch-modal-scope">
+                <strong>{jobFiles.filter(f =>
+                  (f.has_preview && f.file_type !== 'pdf') ||
+                  (f.file_type === 'pdf' && (f.has_preview || f.needs_extraction))
+                ).length}</strong> eligible file(s) will be processed.
+                {jobFiles.some(f => f.file_type === 'pdf' && f.needs_extraction) && (
+                  <span> PDF files will be extracted and tabularized automatically before processing.</span>
+                )}
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button className="btn-ghost" onClick={() => setShowBatchModal(false)}>Cancel</button>
+              <button className="btn-primary" onClick={handleBatchProcess}>
+                🚀 Run All Files
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── New Job Modal ── */}
+      {showNewJobModal && (
+        <div className="modal-overlay" onClick={() => setShowNewJobModal(false)}>
+          <div className="modal-box" onClick={e => e.stopPropagation()}>
+            <div className="modal-title">Create New Multi-File Job</div>
+            <label className="modal-label">
+              Job Purpose <span className="modal-required">*</span>
+              <input
+                className="modal-input"
+                type="text"
+                placeholder="e.g. Invoice Processing — Q1 2025"
+                value={newJobPurpose}
+                onChange={e => setNewJobPurpose(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && handleCreateJob()}
+                autoFocus
+              />
+            </label>
+            <label className="modal-label">
+              Description <span className="modal-optional">(optional)</span>
+              <textarea
+                className="modal-input modal-textarea"
+                placeholder="Additional context about this job..."
+                value={newJobDesc}
+                onChange={e => setNewJobDesc(e.target.value)}
+                rows={3}
+              />
+            </label>
+            <div className="modal-actions">
+              <button className="btn-ghost" onClick={() => setShowNewJobModal(false)}>Cancel</button>
+              <button
+                className="btn-primary"
+                onClick={handleCreateJob}
+                disabled={!newJobPurpose.trim() || newJobCreating}
+              >
+                {newJobCreating ? '⏳ Creating…' : '✓ Create Job'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
