@@ -33,6 +33,18 @@ interface Job {
   created_at: string | null
 }
 
+interface TokenUsage {
+  input: number
+  output: number
+}
+interface FileTokenUsage {
+  extract?: TokenUsage
+  infer?: TokenUsage
+  generate?: TokenUsage
+  execute?: TokenUsage
+  total?: TokenUsage
+}
+
 interface JobFileEntry {
   file_id: string
   filename: string
@@ -47,6 +59,7 @@ interface JobFileEntry {
   validation_attempts: ValidationAttempt[]
   created_at: string | null
   needs_extraction?: boolean
+  token_usage?: FileTokenUsage
 }
 
 
@@ -1108,6 +1121,16 @@ function App() {
                     {activeJobPurpose}
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    {(() => {
+                      const totalIn = jobFiles.reduce((s, f) => s + (f.token_usage?.total?.input ?? 0), 0)
+                      const totalOut = jobFiles.reduce((s, f) => s + (f.token_usage?.total?.output ?? 0), 0)
+                      const grand = totalIn + totalOut
+                      return grand > 0 ? (
+                        <span className="token-badge" title={`↑ ${totalIn.toLocaleString()} input · ↓ ${totalOut.toLocaleString()} output`}>
+                          🪙 {grand >= 1000 ? `${(grand / 1000).toFixed(1)}k` : grand} tokens
+                        </span>
+                      ) : null
+                    })()}
                     {jobFiles.some(f =>
                       (f.has_preview && f.file_type !== 'pdf') ||
                       (f.file_type === 'pdf' && (f.has_preview || f.needs_extraction))
@@ -1184,6 +1207,14 @@ function App() {
                               {fillPct}% fill
                             </span>
                           )}
+                          {(() => {
+                            const t = f.token_usage?.total
+                            const n = (t?.input ?? 0) + (t?.output ?? 0)
+                            if (!n) return null
+                            const label = n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`
+                            const tip = `↑ ${(t?.input ?? 0).toLocaleString()} input · ↓ ${(t?.output ?? 0).toLocaleString()} output`
+                            return <span className="token-badge-file" title={tip}>🪙 {label}</span>
+                          })()}
                         </div>
                         <div className="mf-file-actions">
                           {f.has_preview && !f.has_schema && (

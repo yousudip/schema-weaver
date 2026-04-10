@@ -18,11 +18,11 @@ def _project_root() -> Path:
 class Settings:
     local_storage_dir: Path
     database_url: str
-    azure_openai_endpoint: str
-    azure_openai_api_key: str
-    azure_openai_deployment_gpt5: str
-    azure_openai_deployment_gpt5_mini: str
-    azure_openai_deployment_embeddings: str
+    openai_endpoint: str
+    openai_api_key: str
+    openai_deployment_gpt5: str
+    openai_deployment_gpt5_mini: str
+    openai_deployment_embeddings: str
     sandbox_image: str
     sandbox_cpu: float
     sandbox_memory_mb: int
@@ -39,11 +39,11 @@ def get_settings() -> Settings:
     if not storage_dir.is_absolute():
         storage_dir = root / storage_dir
     database_url = os.getenv("DATABASE_URL", "").strip()
-    azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
-    azure_api_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
-    azure_gpt5 = os.getenv("AZURE_OPENAI_DEPLOYMENT_GPT5", "").strip()
-    azure_gpt5_mini = os.getenv("AZURE_OPENAI_DEPLOYMENT_GPT5_MINI", "").strip()
-    azure_embeddings = os.getenv("AZURE_OPENAI_DEPLOYMENT_EMBEDDINGS", "").strip()
+    endpoint = os.getenv("OPENAI_ENDPOINT", "").strip()
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    gpt5 = os.getenv("OPENAI_DEPLOYMENT_GPT5", "").strip()
+    gpt5_mini = os.getenv("OPENAI_DEPLOYMENT_GPT5_MINI", "").strip()
+    embeddings = os.getenv("OPENAI_DEPLOYMENT_EMBEDDINGS", "").strip()
     sandbox_image = os.getenv("SANDBOX_IMAGE", "gdc-sandbox:local").strip()
     sandbox_cpu = float(os.getenv("SANDBOX_CPU", "1"))
     sandbox_memory_mb = int(os.getenv("SANDBOX_MEMORY_MB", "512"))
@@ -53,18 +53,18 @@ def get_settings() -> Settings:
     cors_origins = [origin.strip() for origin in cors_raw.split(",") if origin.strip()]
 
     # Normalize endpoint if a full path was provided.
-    if azure_endpoint and "/openai/" in azure_endpoint:
-        parsed = urlparse(azure_endpoint)
-        azure_endpoint = f"{parsed.scheme}://{parsed.netloc}"
+    if endpoint and "/openai/" in endpoint:
+        parsed = urlparse(endpoint)
+        endpoint = f"{parsed.scheme}://{parsed.netloc}"
 
     return Settings(
         local_storage_dir=storage_dir,
         database_url=database_url,
-        azure_openai_endpoint=azure_endpoint,
-        azure_openai_api_key=azure_api_key,
-        azure_openai_deployment_gpt5=azure_gpt5,
-        azure_openai_deployment_gpt5_mini=azure_gpt5_mini,
-        azure_openai_deployment_embeddings=azure_embeddings,
+        openai_endpoint=endpoint,
+        openai_api_key=api_key,
+        openai_deployment_gpt5=gpt5,
+        openai_deployment_gpt5_mini=gpt5_mini,
+        openai_deployment_embeddings=embeddings,
         sandbox_image=sandbox_image,
         sandbox_cpu=sandbox_cpu,
         sandbox_memory_mb=sandbox_memory_mb,

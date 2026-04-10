@@ -1655,6 +1655,28 @@ details[open] .sandbox-log-title::before { content: '▼ '; }
 .fill-warn { background: #fef3c7; color: var(--yellow); }
 .fill-bad  { background: var(--red-light); color: var(--red); }
 
+/* ── Token usage badges ─────────────────────────────────────── */
+.token-badge-file {
+  font-size: 0.68rem;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 20px;
+  background: #ede9fe;
+  color: #6d28d9;
+  flex-shrink: 0;
+  cursor: default;
+}
+.token-badge {
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 20px;
+  background: #ede9fe;
+  color: #6d28d9;
+  cursor: default;
+  white-space: nowrap;
+}
+
 .mf-file-actions {
   display: flex;
   align-items: center;

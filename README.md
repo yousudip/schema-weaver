@@ -151,13 +151,13 @@ DATABASE_URL=postgresql://user:password@localhost:5432/schema_weaver
 LOCAL_STORAGE_DIR=storage
 
 # Azure OpenAI — your resource endpoint and API key
-AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
-AZURE_OPENAI_API_KEY=your-api-key-here
+OPENAI_ENDPOINT=https://your-resource.openai.azure.com
+OPENAI_API_KEY=your-api-key-here
 
 # Deployment names from your Azure OpenAI resource
-AZURE_OPENAI_DEPLOYMENT_GPT5=gpt-5
-AZURE_OPENAI_DEPLOYMENT_GPT5_MINI=gpt-5-mini
-AZURE_OPENAI_DEPLOYMENT_EMBEDDINGS=text-embedding-3-small
+OPENAI_DEPLOYMENT_GPT5=gpt-5
+OPENAI_DEPLOYMENT_GPT5_MINI=gpt-5-mini
+OPENAI_DEPLOYMENT_EMBEDDINGS=text-embedding-3-small
 
 # Docker sandbox configuration
 SANDBOX_IMAGE=gdc-sandbox:local

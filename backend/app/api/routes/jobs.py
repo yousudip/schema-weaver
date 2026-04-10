@@ -220,6 +220,7 @@ async def list_job_files(request: Request, job_id: str) -> Dict:
                 "execution_ok": bool((f.analysis or {}).get("execution_ok")),
                 "quality_report": (f.analysis or {}).get("quality_report"),
                 "validation_attempts": (f.analysis or {}).get("validation_attempts", []),
+                "token_usage": (f.analysis or {}).get("token_usage"),
                 "created_at": f.created_at.isoformat() if f.created_at else None,
                 "needs_extraction": f.file_type == "pdf" and not f.result,
             }

@@ -143,7 +143,7 @@ async def infer_schema(request: Request, job_id: str) -> Dict[str, Any]:
 
         client = request.app.state.llm_client
         prompt = build_prompt(preview)
-        model = request.app.state.settings.azure_openai_deployment_gpt5_mini
+        model = request.app.state.settings.openai_deployment_gpt5_mini
         response = client.responses.create(
             model=model,
             input=prompt,
@@ -206,7 +206,7 @@ async def select_schema(
 @router.post("/api/v1/jobs/{job_id}/schema/embeddings")
 async def build_schema_embeddings(request: Request, job_id: str) -> Dict[str, Any]:
     settings = request.app.state.settings
-    model = settings.azure_openai_deployment_embeddings
+    model = settings.openai_deployment_embeddings
     if not model:
         return {"status": "error", "message": "Embedding model deployment is not set."}
     session = get_db_session(request.app.state.db_session_factory)
@@ -253,7 +253,7 @@ async def build_schema_embeddings(request: Request, job_id: str) -> Dict[str, An
 @router.post("/api/v1/schema/match")
 async def match_schema(request: Request, body: SchemaMatchRequest) -> Dict[str, Any]:
     settings = request.app.state.settings
-    model = settings.azure_openai_deployment_embeddings
+    model = settings.openai_deployment_embeddings
     if not model:
         return {"status": "error", "message": "Embedding model deployment is not set."}
     query_text = body.text.strip()
@@ -309,7 +309,7 @@ async def generate_code(request: Request, job_id: str) -> Dict[str, Any]:
         preview["file_type"] = job.result.get("file_type", "csv")
 
         client = request.app.state.llm_client
-        model = request.app.state.settings.azure_openai_deployment_gpt5_mini
+        model = request.app.state.settings.openai_deployment_gpt5_mini
         prompt = build_codegen_prompt(schema, preview)
 
         response = client.responses.create(model=model, input=prompt)
@@ -374,7 +374,7 @@ async def execute_code(request: Request, job_id: str, body: ExecuteRequest | Non
         input_filename = "input_file" + original_ext
 
         client = request.app.state.llm_client
-        model = request.app.state.settings.azure_openai_deployment_gpt5_mini
+        model = request.app.state.settings.openai_deployment_gpt5_mini
 
         sandbox_session = session_mgr.create_session()
         output_path_host = Path(sandbox_session.workspace_dir) / "output.csv"
@@ -607,7 +607,7 @@ async def execute_code_stream(request: Request, job_id: str, body: ExecuteReques
             input_filename = "input_file" + original_ext
 
             client = request.app.state.llm_client
-            model = request.app.state.settings.azure_openai_deployment_gpt5_mini
+            model = request.app.state.settings.openai_deployment_gpt5_mini
 
             sandbox_session = session_mgr.create_session()
             output_path_host = Path(sandbox_session.workspace_dir) / "output.csv"

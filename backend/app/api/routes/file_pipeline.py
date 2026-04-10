@@ -61,6 +61,41 @@ def _get_job_and_file(session, job_id: str, file_id: str):
     return job, jf
 
 
+def _tok(response) -> dict:
+    """Extract token counts from an LLM Responses API response object."""
+    try:
+        u = response.usage
+        return {
+            "input": getattr(u, "input_tokens", 0) or 0,
+            "output": getattr(u, "output_tokens", 0) or 0,
+        }
+    except Exception:
+        return {"input": 0, "output": 0}
+
+
+def _add_tokens(acc: dict, new: dict) -> dict:
+    """Merge a token dict {input, output} into an accumulator."""
+    return {
+        "input": acc.get("input", 0) + new.get("input", 0),
+        "output": acc.get("output", 0) + new.get("output", 0),
+    }
+
+
+_FILE_OPS = ("extract", "infer", "generate", "execute")
+
+
+def _update_token_usage(analysis: dict, op: str, tokens: dict) -> dict:
+    """Write tokens for `op` into analysis["token_usage"] and recompute total."""
+    usage = dict(analysis.get("token_usage") or {})
+    usage[op] = _add_tokens(usage.get(op, {}), tokens)
+    usage["total"] = {
+        "input": sum(usage[o]["input"] for o in _FILE_OPS if o in usage),
+        "output": sum(usage[o]["output"] for o in _FILE_OPS if o in usage),
+    }
+    analysis["token_usage"] = usage
+    return analysis
+
+
 # ─── Infer schema ──────────────────────────────────────────────────────────────
 
 @router.post("/api/v1/jobs/{job_id}/files/{file_id}/infer")
@@ -79,19 +114,21 @@ async def infer_file_schema(request: Request, job_id: str, file_id: str) -> Dict
         session.commit()
 
         client = request.app.state.llm_client
-        model = request.app.state.settings.azure_openai_deployment_gpt5_mini
+        model = request.app.state.settings.openai_deployment_gpt5_mini
         purpose = job.purpose
 
         prompt = build_prompt(preview, purpose=purpose)
         response = client.responses.create(model=model, input=prompt)
         raw_text = response.output_text
         parsed = coerce_inference_payload(parse_llm_json(raw_text))
+        infer_tokens = _tok(response)
 
         try:
             validated = SchemaInference.model_validate(parsed).model_dump()
         except ValidationError as exc:
             retry_prompt = build_reflexion_prompt(preview, str(exc))
             retry_resp = client.responses.create(model=model, input=retry_prompt)
+            infer_tokens = _add_tokens(infer_tokens, _tok(retry_resp))
             retry_parsed = coerce_inference_payload(parse_llm_json(retry_resp.output_text))
             try:
                 validated = SchemaInference.model_validate(retry_parsed).model_dump()
@@ -103,6 +140,7 @@ async def infer_file_schema(request: Request, job_id: str, file_id: str) -> Dict
 
         analysis = dict(jf.analysis or {})
         analysis["schema_inference"] = validated
+        analysis = _update_token_usage(analysis, "infer", infer_tokens)
         jf.analysis = analysis
         jf.status = "ready"
         session.commit()
@@ -176,11 +214,12 @@ async def generate_file_code(request: Request, job_id: str, file_id: str) -> Dic
         session.commit()
 
         client = request.app.state.llm_client
-        model = request.app.state.settings.azure_openai_deployment_gpt5_mini
+        model = request.app.state.settings.openai_deployment_gpt5_mini
         prompt = build_codegen_prompt(schema, preview, purpose=job.purpose)
 
         response = client.responses.create(model=model, input=prompt)
         raw_code = parse_generated_code(response.output_text)
+        gen_tokens = _tok(response)
 
         # Post-process: strip any stray PDF checks the LLM may have added
         if raw_file_type == "pdf":
@@ -196,6 +235,7 @@ async def generate_file_code(request: Request, job_id: str, file_id: str) -> Dic
         analysis = dict(jf.analysis)
         analysis["generated_code"] = raw_code
         analysis["generated_code_v"] = analysis.get("generated_code_v", 0) + 1
+        analysis = _update_token_usage(analysis, "generate", gen_tokens)
         jf.analysis = analysis
         jf.status = "ready"
         session.commit()
@@ -270,7 +310,7 @@ async def execute_file_stream(
             input_filename = "input_file" + original_ext
 
             client = request.app.state.llm_client
-            model = request.app.state.settings.azure_openai_deployment_gpt5_mini
+            model = request.app.state.settings.openai_deployment_gpt5_mini
 
             jf.status = "executing"
             session.commit()
@@ -290,6 +330,7 @@ async def execute_file_stream(
             quality_report = None
             validation_attempts: list[dict] = []
             current_code = user_code
+            execute_tokens: dict = {"input": 0, "output": 0}
 
             try:
                 if is_pdf:
@@ -342,6 +383,7 @@ async def execute_file_stream(
                             fix_resp = await loop.run_in_executor(
                                 None, lambda p=fix_prompt: client.responses.create(model=model, input=p)
                             )
+                            execute_tokens = _add_tokens(execute_tokens, _tok(fix_resp))
                             current_code = parse_generated_code(fix_resp.output_text)
                             attempt_log += "\n[reflexion fix applied]"
                             await loop.run_in_executor(
@@ -415,6 +457,7 @@ async def execute_file_stream(
                         val_resp = await loop.run_in_executor(
                             None, lambda p=val_prompt: client.responses.create(model=model, input=p)
                         )
+                        execute_tokens = _add_tokens(execute_tokens, _tok(val_resp))
                         verdict = parse_validation_response(val_resp.output_text)
 
                         if verdict.get("verdict") == "pass":
@@ -479,6 +522,8 @@ async def execute_file_stream(
             if current_code != user_code:
                 analysis_dict["generated_code"] = current_code
                 analysis_dict["self_healed"] = True
+            if execute_tokens["input"] or execute_tokens["output"]:
+                analysis_dict = _update_token_usage(analysis_dict, "execute", execute_tokens)
             jf.analysis = analysis_dict
             jf.status = "validated" if (quality_report and quality_report.get("pass")) else (
                 "ready" if cleaned_preview else "failed"
@@ -491,6 +536,7 @@ async def execute_file_stream(
                 "cleaned_preview": cleaned_preview,
                 "quality_report": quality_report,
                 "validation_attempts": validation_attempts,
+                "token_usage": analysis_dict.get("token_usage"),
                 "file_id": file_id,
             })
 
@@ -544,7 +590,7 @@ async def extract_pdf_stream(
 
             client = request.app.state.llm_client
             settings = request.app.state.settings
-            model = settings.azure_openai_deployment_gpt5_mini
+            model = settings.openai_deployment_gpt5_mini
             purpose = job.purpose
 
             # Step 1: Detect
@@ -602,6 +648,7 @@ async def extract_pdf_stream(
                     None, lambda: client.responses.create(model=model, input=llm_input)
                 )
                 raw_text_response = response.output_text
+                extract_tokens = _tok(response)
                 parsed = await loop.run_in_executor(
                     None, lambda: parse_tabular_llm_response(raw_text_response)
                 )
@@ -616,6 +663,7 @@ async def extract_pdf_stream(
                     "file_type": "pdf",
                     "extraction_method": pdf_type,
                 }
+                jf.analysis = _update_token_usage(dict(jf.analysis or {}), "extract", extract_tokens)
                 jf.status = "ready"
                 session.commit()
                 yield _sse("complete", {
@@ -810,13 +858,14 @@ async def consolidate_job_stream(request: Request, job_id: str) -> StreamingResp
 
         # ── Step 3: LLM column mapping (slow network call) ────────────────────
         client = request.app.state.llm_client
-        model = request.app.state.settings.azure_openai_deployment_gpt5_mini
+        model = request.app.state.settings.openai_deployment_gpt5_mini
         prompt = build_consolidation_prompt(file_schemas, purpose=job_data["purpose"])
 
         try:
             llm_resp = await _asyncio.to_thread(
                 lambda: client.responses.create(model=model, input=prompt)
             )
+            consolidate_tokens = _tok(llm_resp)
             mapping = parse_consolidation_mapping(llm_resp.output_text)
         except Exception as e:
             yield _sse("error", {"message": f"LLM mapping failed: {e}"})
@@ -903,6 +952,7 @@ async def consolidate_job_stream(request: Request, job_id: str) -> StreamingResp
                     job_analysis["consolidated_preview"] = consolidated_preview
                     job_analysis["column_mapping"] = mapping
                     job_analysis["merge_errors"] = merge_errors
+                    job_analysis.setdefault("token_usage", {})["consolidate"] = consolidate_tokens
                     job.analysis = job_analysis
                     _flag_modified(job, "analysis")
                     session.commit()
@@ -923,6 +973,7 @@ async def consolidate_job_stream(request: Request, job_id: str) -> StreamingResp
             "consolidated_preview": consolidated_preview,
             "column_mapping": mapping,
             "merge_errors": merge_errors,
+            "consolidate_tokens": consolidate_tokens,
             "message": f"Merged {len(ready_files)} files → {consolidated_preview['row_count']} rows, {len(consolidated_preview['columns'])} columns.",
         })
 
@@ -942,7 +993,7 @@ async def download_consolidated(request: Request, job_id: str) -> StreamingRespo
         if not job:
             raise HTTPException(status_code=404, detail="Job not found.")
         path_str = (job.analysis or {}).get("consolidated_csv_path")
-        job_name = (job.name or job_id).replace(" ", "_")[:40]
+        job_name = (job.purpose or job.filename or job_id).replace(" ", "_")[:40]
     finally:
         session.close()
 
