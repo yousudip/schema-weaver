@@ -29,6 +29,12 @@ The result: data onboarding that used to take days now takes minutes.
 
 ---
 
+## Demo
+
+https://github.com/user-attachments/assets/6ec12f10-a934-4cc5-8e30-1dd0c44581d5
+
+---
+
 ## Key Features
 
 | | Feature | Description |
